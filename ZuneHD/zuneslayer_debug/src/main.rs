@@ -249,90 +249,109 @@ fn kreadfile(tcp: &mut TcpStream, addr: u32, p: u32) -> Vec<u8> {
     o
 }
 
-fn kttttt(tcp: &mut TcpStream) {
-    // let addr: u32 = 0x7000_F800; // no wrk
-    // let addr: u32 = 0xD000_0000; // wrk - empty
-    // let addr: u32 = 0x7000_f000;
-
-    //irom
-    // let addr: u32 = 0xFFF0_0000;
-    // let offset:u32 = 0x0000_0000;
-    // let sz: u32    = 0x0010_0000;
-
-    // // iram a
-    // let addr: u32  = 0x4000_0000;
-    // let offset:u32 = 0x0000_0000;
-    // let sz: u32    = 0x0001_0000;
-    //
-    // // iram b
-    // let addr: u32  = 0x4001_0000;
-    // let offset:u32 = 0x0000_0000;
-    // let sz: u32    = 0x0001_0000;
-
-    // iram c // no
-    let addr: u32  = 0x4002_0000;
-    let offset:u32 = 0x0000_0000;
-    let sz: u32    = 0x0001_0000;
-
-    // // iram d
-    // let addr: u32  = 0x4003_0000;
-    // let offset:u32 = 0x0000_0000;
-    // let sz: u32    = 0x0001_0000;
-
-    // let addr: u32 = 0x4000_0000;
-
-    // kfuse
-    // let addr: u32  = 0x7000_0000;
-    // let offset:u32 = 0x0000_fc00;
-
-    //secure boot
-    let addr: u32  = 0x6000_0000;
-    let offset:u32 = 0x0000_c200;
-    let sz: u32    = 0x0001_0000;
-
-    // clk
-    // let addr: u32  = 0x6000_6000;
-    // let offset:u32 = 0x0000_0000;
-    // let sz: u32    = 0x0001_0000;
-
-    // ram
-    // let addr: u32  = 0x8000_0000;
-    // let offset:u32 = 0x0000_0000;
-    // let sz: u32    = 0x0020_0000;
-
-    // nor
-    // let addr: u32  = 0xd000_0000;
-    // let offset:u32 = 0x0000_0000;
-    // let sz: u32    = 0x0001_0000;
-
-    // so far: can't change secboot or clk????, maybe we are dealing with a copy not a real phy mapping?
-
+fn physdump(tcp: &mut TcpStream, addr: u32, offset: u32, sz: u32, filename: &str) {
+    println!("[*] Dumping 0x{:08x}+0x{:x} ({}KB) -> {}", addr, offset, sz/1024, filename);
 
     let mut c = Vec::new();
     c.push(15u8);
     c.extend_from_slice(addr.to_le_bytes().as_slice());
     c.extend_from_slice(offset.to_le_bytes().as_slice());
-   c.extend_from_slice(sz.to_le_bytes().as_slice());
-
-
+    c.extend_from_slice(sz.to_le_bytes().as_slice());
     c.resize(32, 0);
     tcp.write_all(&c).unwrap();
 
-    let mut iubu = [0u8; 1];
+    let mut buf = [0u8; 4096];
     let mut o = Vec::new();
+    let target = sz as usize - 1;
     loop {
-        let c = tcp.read(&mut iubu).unwrap();
-       if o.len() % 0x100 == 0 {
-            println!("c = {:x}", o.len());
-       }
-        o.extend_from_slice(&iubu[..c]);
-
-        std::fs::write("./test.bin", &o).unwrap();
-
-        if o.len() == sz as usize-1 {
+        let n = tcp.read(&mut buf).unwrap();
+        o.extend_from_slice(&buf[..n]);
+        if o.len() % 0x4000 == 0 || o.len() >= target {
+            println!("  {:x}/{:x} ({:.0}%)", o.len(), target, o.len() as f64 / target as f64 * 100.0);
+        }
+        if o.len() >= target {
             break;
         }
     }
+    std::fs::write(filename, &o).unwrap();
+    println!("[+] {} written ({} bytes)", filename, o.len());
+}
+
+fn dump_via_kread(tcp: &mut TcpStream, vaddr: u32, sz: u32, filename: &str) {
+    println!("[*] kread 0x{:08x} ({}B) -> {}", vaddr, sz, filename);
+    let mut data = Vec::new();
+    for off in (0..sz).step_by(4) {
+        let val = kread_u32(tcp, vaddr + off);
+        data.extend_from_slice(&val.to_le_bytes());
+        if off % 0x100 == 0 && off > 0 {
+            print!("  0x{:x}..  \r", off);
+        }
+    }
+    std::fs::write(filename, &data).unwrap();
+    println!("[+] {} written ({} bytes)", filename, data.len());
+}
+
+fn kttttt(tcp: &mut TcpStream) {
+    std::fs::create_dir_all("dumps").unwrap();
+
+    // First try physdump for IRAM (large regions, cmd 15)
+    // If that fails, fall back to kread
+
+    // Use kread_u32 via kernel virtual addresses
+    // NKCreateStaticMapping maps phys >> 8 to kernel VA
+    // But we don't know the VAs, so use physdump (cmd 15) for everything
+
+    // Try physdump one at a time with error handling
+    let regions: Vec<(u32, u32, u32, &str)> = vec![
+        (0x6000_0000, 0xC000, 0x100, "dumps/ahb_arb.bin"),
+        (0x6000_0000, 0xC200, 0x100, "dumps/secboot.bin"),
+        (0x6001_0000, 0x1000, 0x100, "dumps/bsev.bin"),
+        (0x6000_0000, 0x6000, 0x400, "dumps/clk_rst.bin"),
+        (0x7000_0000, 0xF800, 0x400, "dumps/fuse.bin"),
+        (0x4000_0000, 0x0000, 0x10000, "dumps/iram_a.bin"),
+        (0x4001_0000, 0x0000, 0x10000, "dumps/iram_b.bin"),
+        (0x4002_0000, 0x0000, 0x10000, "dumps/iram_c.bin"),
+        (0x4003_0000, 0x0000, 0x10000, "dumps/iram_d.bin"),
+    ];
+
+    for (addr, offset, sz, filename) in &regions {
+        println!("[*] Dumping 0x{:08x}+0x{:x} ({}B) -> {}", addr, offset, sz, filename);
+
+        let mut c = Vec::new();
+        c.push(15u8);
+        c.extend_from_slice(addr.to_le_bytes().as_slice());
+        c.extend_from_slice(offset.to_le_bytes().as_slice());
+        c.extend_from_slice(sz.to_le_bytes().as_slice());
+        c.resize(32, 0);
+        tcp.write_all(&c).unwrap();
+
+        let target = *sz as usize - 1;
+        let mut buf = [0u8; 4096];
+        let mut o = Vec::new();
+        let mut failed = false;
+        loop {
+            match tcp.read(&mut buf) {
+                Ok(0) => { println!("  EOF"); failed = true; break; }
+                Ok(n) => {
+                    o.extend_from_slice(&buf[..n]);
+                    if o.len() >= target { break; }
+                }
+                Err(e) => {
+                    println!("  read error at 0x{:x}: {}", o.len(), e);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed && o.is_empty() {
+            println!("[-] SKIP {}", filename);
+            continue;
+        }
+        std::fs::write(filename, &o).unwrap();
+        println!("[+] {} ({} bytes)", filename, o.len());
+    }
+
+    println!("[DONE] All dumps complete");
 }
 
 fn kquit(tcp: &mut TcpStream) {
@@ -723,8 +742,8 @@ fn dlfile(tcp: &mut TcpStream, base: &String) -> Option<Vec<u8>> {
 fn main() {
     tracing_subscriber::fmt::fmt().init();
 
-    let mut tcp = TcpStream::connect(("192.168.1.20", 1337)).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut tcp = TcpStream::connect(("192.168.0.67", 1337)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     tcp.set_nodelay(true).unwrap();
 
     loop {
@@ -743,7 +762,7 @@ fn main() {
     let nk = kread_u32(&mut tcp, 0x80bee010);
     println!("{nk:x}");
 
-    if false {
+    if true {
         kttttt(&mut tcp);
         return
     }

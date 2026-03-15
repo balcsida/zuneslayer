@@ -1,1 +1,25 @@
 *:Zone.Identifier:$DATA
+
+# Rust
+target/
+
+# Visual Studio
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.suo
+*.user
+*.ncb
+*.aps
+*.cachefile
+bin/
+obj/
+Debug/
+Release/
+*.opensdf
+*.sdf
+
+# IDE
+.idea/
+.vs/

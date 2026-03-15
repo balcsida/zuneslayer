@@ -217,10 +217,6 @@
 			UniqueIdentifier="{93995380-89BD-4b04-88EB-625FBE52EBFB}"
 			>
 			<File
-				RelativePath=".\kwasm\fixes.h"
-				>
-			</File>
-			<File
 				RelativePath=".\protocol\msg.pb.h"
 				>
 			</File>
@@ -241,31 +237,11 @@
 				>
 			</File>
 			<File
-				RelativePath=".\kwasm\platform.h"
-				>
-			</File>
-			<File
-				RelativePath=".\plugin.h"
-				>
-			</File>
-			<File
-				RelativePath=".\kwasm\thunk.h"
-				>
-			</File>
-			<File
-				RelativePath=".\kwasm\util.h"
-				>
-			</File>
-			<File
-				RelativePath=".\kwasm\wa.h"
-				>
-			</File>
-			<File
 				RelativePath=".\wasm.h"
 				>
 			</File>
 			<File
-				RelativePath="C:\Users\zune\Downloads\Web Server [Source]\nativeapp\xutility.h"
+				RelativePath=".\xutility.h"
 				>
 			</File>
 		</Filter>
@@ -280,12 +256,6 @@
 			Filter="cpp;c;cc;cxx;def;odl;idl;hpj;bat;asm;asmx"
 			UniqueIdentifier="{4FC737F1-C7A5-4376-A066-2A32D752A2FF}"
 			>
-			<File
-				RelativePath=".\kwasm\main.c"
-				>
-				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-			</File>
 			<File
 				RelativePath=".\main.cpp"
 				>
@@ -305,30 +275,6 @@
 			<File
 				RelativePath=".\protocol\pb_encode.c"
 				>
-			</File>
-			<File
-				RelativePath=".\kwasm\platform.c"
-				>
-				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-			</File>
-			<File
-				RelativePath=".\kwasm\thunk.c"
-				>
-				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-			</File>
-			<File
-				RelativePath=".\kwasm\util.c"
-				>
-				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-			</File>
-			<File
-				RelativePath=".\kwasm\wa.c"
-				>
-				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 			<File
 				RelativePath=".\wasm.cpp"

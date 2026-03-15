@@ -141,7 +141,7 @@ void connection(SOCKET client) {
 	unsigned char* inbuf = (unsigned char*)calloc(INBUFSZ, 1);
 	unsigned char* out = (unsigned char*)calloc(OBUFSZ, 1);
 
-		char* c = "Hello\n";
+		char* c = "Helo2\n";
 		if (send(client,c,strlen(c),0) == SOCKET_ERROR){
 			closesocket(client);
 			return;

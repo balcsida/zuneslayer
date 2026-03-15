@@ -12,9 +12,7 @@
 #include <stdio.h>
 #include "xutility.h"
 
-// zdksystem.h pulls in compclient.h -> EGL/egl.h, declare what we need directly
-extern "C" void ZDKSystem_ShowMessageBox(LPCWSTR text, int type);
-#define MESSAGEBOX_TYPE_OK 0
+#include <zdksystem.h>
 
 // VirtualCopy not in OpenZDK headers, declare from WinCE API
 extern "C" BOOL VirtualCopy(LPVOID lpvDest, LPVOID lpvSrc, DWORD cbSize, DWORD fdwProtect);

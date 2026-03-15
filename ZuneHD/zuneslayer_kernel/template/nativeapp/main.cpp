@@ -17,22 +17,12 @@
 #include "wasm.h"
 
 #include <assert.h>
-#include <compclient.h>
-#include <float.h>
-#include <math.h>
 #include <stdio.h>
 #include <windows.h>
-#include <zdkinput.h>
-// #include <zdkgl.h>
 #include <zdksystem.h>
 #include <zdknet.h>
-#include <zam.h>
-#include <znet.h>
-#include <wininet.h>
 #include <winsock2.h>
-#include <wininet.h>
 #include <Iphlpapi.h>
-#include <winsock2.h>
 #include "protocol/pb_encode.h"
 #include "protocol/pb_decode.h"
 #include "protocol/msg.pb.h"

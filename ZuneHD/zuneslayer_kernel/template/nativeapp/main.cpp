@@ -12,7 +12,19 @@
 #include <stdio.h>
 #include "xutility.h"
 
-#include <zdksystem.h>
+// zdksystem.h pulls in compclient.h -> EGL/egl.h, declare what we need directly
+extern "C" {
+	void ZDKSystem_ShowMessageBox(LPCWSTR text, int type);
+	#define MESSAGEBOX_TYPE_OK 0
+	void SuppressReboot();
+}
+
+// VirtualCopy not in OpenZDK headers, declare from WinCE API
+extern "C" BOOL VirtualCopy(LPVOID lpvDest, LPVOID lpvSrc, DWORD cbSize, DWORD fdwProtect);
+#ifndef PAGE_PHYSICAL
+#define PAGE_PHYSICAL 0x00400000
+#endif
+
 #include <winsock2.h>
 #include <Iphlpapi.h>
 #include "protocol/pb_encode.h"
@@ -502,7 +514,7 @@ for(u32 i =0; i <idx; i++) {
 	if (va) {
 		// PAGE_PHYSICAL = 0x00400000, PAGE_NOCACHE = 0x200
 		ok = VirtualCopy(va, (void*)(phys_addr >> 8), 0x10000,
-		                 PAGE_READWRITE | PAGE_NOCACHE | 0x00400000);
+		                 PAGE_READWRITE | PAGE_NOCACHE | PAGE_PHYSICAL);
 	}
 
 	unsigned char* rbuf = (unsigned char*)calloc(6 + count, 1);
@@ -538,7 +550,7 @@ for(u32 i =0; i <idx; i++) {
 	BOOL ok = FALSE;
 	if (va) {
 		ok = VirtualCopy(va, (void*)(phys_addr >> 8), 0x10000,
-		                 PAGE_READWRITE | PAGE_NOCACHE | 0x00400000);
+		                 PAGE_READWRITE | PAGE_NOCACHE | PAGE_PHYSICAL);
 	}
 
 	out[0] = 18;
@@ -571,7 +583,7 @@ for(u32 i =0; i <idx; i++) {
 	BOOL ok = FALSE;
 	if (bsev_va) {
 		ok = VirtualCopy(bsev_va, (void*)(0x60010000 >> 8), 0x10000,
-		                 PAGE_READWRITE | PAGE_NOCACHE | 0x00400000);
+		                 PAGE_READWRITE | PAGE_NOCACHE | PAGE_PHYSICAL);
 	}
 
 	out[0] = 19;

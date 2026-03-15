@@ -437,32 +437,28 @@ void connection(SOCKET client) {
 	kwr(0x80060da0, 0x80015020);
 	KFSH ghi = (KFSH) GetProcAddress(mh, L"GetFSHeapInfo");
 
-	unsigned char* rbuf = (unsigned char*)calloc(10 + count, 1);
-	rbuf[0] = 17;
+	// Always send 32-byte status first
+	out[0] = 17;
+	out[1] = mapped ? 1 : 0;
+	out[2] = mapped & 0xFF;
+	out[3] = (mapped >> 8) & 0xFF;
+	out[4] = (mapped >> 16) & 0xFF;
+	out[5] = (mapped >> 24) & 0xFF;
+	out[6] = err & 0xFF;
+	out[7] = (err >> 8) & 0xFF;
+	out[8] = (err >> 16) & 0xFF;
+	out[9] = (err >> 24) & 0xFF;
+	if (safe_send(client, out, 32)) { closesocket(client); break; }
+
+	// Then stream data if mapping succeeded
 	if (mapped) {
-		rbuf[1] = 1;
-		// Send mapped VA in bytes 2-5 for debugging
-		rbuf[2] = mapped & 0xFF;
-		rbuf[3] = (mapped >> 8) & 0xFF;
-		rbuf[4] = (mapped >> 16) & 0xFF;
-		rbuf[5] = (mapped >> 24) & 0xFF;
+		unsigned char* dbuf = (unsigned char*)calloc(count, 1);
 		for (u32 i = 0; i < count; i++) {
-			rbuf[6 + i] = (unsigned char)ghi(mapped + map_off + i, 0, 0x1338);
+			dbuf[i] = (unsigned char)ghi(mapped + map_off + i, 0, 0x1338);
 		}
-		safe_send(client, rbuf, 6 + count);
-	} else {
-		rbuf[1] = 0;
-		rbuf[2] = err & 0xFF;
-		rbuf[3] = (err >> 8) & 0xFF;
-		rbuf[4] = (err >> 16) & 0xFF;
-		rbuf[5] = (err >> 24) & 0xFF;
-		rbuf[6] = (mapped) & 0xFF;
-		rbuf[7] = (mapped >> 8) & 0xFF;
-		rbuf[8] = (mapped >> 16) & 0xFF;
-		rbuf[9] = (mapped >> 24) & 0xFF;
-		safe_send(client, rbuf, 10);
+		if (safe_send(client, dbuf, count)) { free(dbuf); closesocket(client); break; }
+		free(dbuf);
 	}
-	free(rbuf);
 
 // Cmd 18: Physical I/O write via NKCreateStaticMapping + kernel write
 // Packet: [18][phys_addr:4][offset:4][val:4]

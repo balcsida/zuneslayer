@@ -301,21 +301,20 @@ fn io_read(tcp: &mut TcpStream, phys_addr: u32, offset: u32, count: u32) -> Resu
     c.resize(32, 0);
     tcp.write_all(&c).unwrap();
 
-    // Read response: [17][ok:1][mapped_va:4][data:count] or [17][0][err:4][mapped:4]
-    let mut hdr = [0u8; 6];
-    tcp.read_exact(&mut hdr).map_err(|e| format!("hdr read: {}", e))?;
-    if hdr[0] != 17 { return Err(format!("bad cmd byte: {}", hdr[0])); }
-    let va_or_err = u32::from_le_bytes(hdr[2..6].try_into().unwrap());
-    if hdr[1] == 1 {
-        println!("    mapped VA: 0x{:08x}", va_or_err);
+    // Read 32-byte status: [17][ok][mapped_va:4][err:4][...]
+    let mut resp = [0u8; 32];
+    tcp.read_exact(&mut resp).map_err(|e| format!("resp read: {}", e))?;
+    if resp[0] != 17 { return Err(format!("bad cmd byte: {}", resp[0])); }
+    let mapped = u32::from_le_bytes(resp[2..6].try_into().unwrap());
+    let err = u32::from_le_bytes(resp[6..10].try_into().unwrap());
+    println!("    ok={} mapped=0x{:08x} err={}", resp[1], mapped, err);
+    if resp[1] == 1 {
+        // Read data stream
         let mut data = vec![0u8; count as usize];
         tcp.read_exact(&mut data).map_err(|e| format!("data read: {}", e))?;
         Ok(data)
     } else {
-        let mut extra = [0u8; 4];
-        tcp.read_exact(&mut extra).map_err(|e| format!("extra read: {}", e))?;
-        let mapped_val = u32::from_le_bytes(extra);
-        Err(format!("NKCreateStaticMapping failed, err={}, mapped=0x{:08x}", va_or_err, mapped_val))
+        Err(format!("NKCreateStaticMapping failed, mapped=0x{:08x}, err={}", mapped, err))
     }
 }
 

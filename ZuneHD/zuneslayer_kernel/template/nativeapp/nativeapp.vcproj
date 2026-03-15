@@ -237,10 +237,6 @@
 				>
 			</File>
 			<File
-				RelativePath=".\wasm.h"
-				>
-			</File>
-			<File
 				RelativePath=".\xutility.h"
 				>
 			</File>
@@ -275,12 +271,6 @@
 			<File
 				RelativePath=".\protocol\pb_encode.c"
 				>
-			</File>
-			<File
-				RelativePath=".\wasm.cpp"
-				>
-				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
-				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 		</Filter>
 	</Files>

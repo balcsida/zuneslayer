@@ -410,31 +410,33 @@ void connection(SOCKET client) {
 				dead = true;
 				break;
 
-// Cmd 17: Uncached physical I/O read (for hardware registers)
-// Uses VirtualAlloc + VirtualCopy with PAGE_NOCACHE for true device access
+// Cmd 17: Physical I/O read via NKCreateStaticMapping + kernel R/W gadget
+// Same technique as cmd 15 but for reading hardware registers
 // Packet: [17][phys_addr:4][offset:4][count:4] (count in bytes, max 1024)
-// Response: [17][ok:1][data:count] or [17][0][err:4]
+// Response: [17][1][data:count] or [17][0][err:4]
 } else if (inbuf[0] == 17) {
 	u32 phys_addr = ((u32)inbuf[1]) | ((u32)(inbuf[2] << 8)) | ((u32)(inbuf[3] << 16)) | ((u32)(inbuf[4] << 24));
 	u32 io_offset = ((u32)inbuf[5]) | ((u32)(inbuf[6] << 8)) | ((u32)(inbuf[7] << 16)) | ((u32)(inbuf[8] << 24));
 	u32 count     = ((u32)inbuf[9]) | ((u32)(inbuf[10] << 8)) | ((u32)(inbuf[11] << 16)) | ((u32)(inbuf[12] << 24));
 	if (count > 1024) count = 1024;
 
-	void* va = VirtualAlloc(0, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
-	BOOL ok = FALSE;
-	if (va) {
-		// PAGE_PHYSICAL = 0x00400000, PAGE_NOCACHE = 0x200
-		ok = VirtualCopy(va, (void*)(phys_addr >> 8), 0x10000,
-		                 PAGE_READWRITE | PAGE_NOCACHE | PAGE_PHYSICAL);
-	}
+	HMODULE mh = GetModuleHandleW(L"coredll.dll");
 
-	unsigned char* rbuf = (unsigned char*)calloc(6 + count, 1);
+	// Redirect GetFSHeapInfo -> NKCreateStaticMapping
+	kwr(0x80060da0, 0x80069de0);
+	CSM csm = (CSM) GetProcAddress(mh, L"GetFSHeapInfo");
+	DWORD mapped = (DWORD)csm(phys_addr >> 8, 0x10000);
+
+	// Restore GetFSHeapInfo -> R/W gadget
+	kwr(0x80060da0, 0x80015020);
+	KFSH ghi = (KFSH) GetProcAddress(mh, L"GetFSHeapInfo");
+
+	unsigned char* rbuf = (unsigned char*)calloc(2 + count, 1);
 	rbuf[0] = 17;
-	if (ok && va) {
+	if (mapped) {
 		rbuf[1] = 1;
-		volatile unsigned char* ptr = (volatile unsigned char*)((BYTE*)va + io_offset);
 		for (u32 i = 0; i < count; i++) {
-			rbuf[2 + i] = ptr[i];
+			rbuf[2 + i] = (unsigned char)ghi(mapped + io_offset + i, 0, 0x1338);
 		}
 		safe_send(client, rbuf, 2 + count);
 	} else {
@@ -446,108 +448,29 @@ void connection(SOCKET client) {
 		rbuf[5] = (err >> 24) & 0xFF;
 		safe_send(client, rbuf, 6);
 	}
-	if (va) VirtualFree(va, 0, MEM_RELEASE);
 	free(rbuf);
 
-// Cmd 18: Uncached physical I/O write (for hardware registers)
+// Cmd 18: Physical I/O write via NKCreateStaticMapping + kernel write
 // Packet: [18][phys_addr:4][offset:4][val:4]
-// Response: [18][ok:1][err:4]
+// Response: [18][ok:1]
 } else if (inbuf[0] == 18) {
 	u32 phys_addr = ((u32)inbuf[1]) | ((u32)(inbuf[2] << 8)) | ((u32)(inbuf[3] << 16)) | ((u32)(inbuf[4] << 24));
 	u32 io_offset = ((u32)inbuf[5]) | ((u32)(inbuf[6] << 8)) | ((u32)(inbuf[7] << 16)) | ((u32)(inbuf[8] << 24));
 	u32 val       = ((u32)inbuf[9]) | ((u32)(inbuf[10] << 8)) | ((u32)(inbuf[11] << 16)) | ((u32)(inbuf[12] << 24));
 
-	void* va = VirtualAlloc(0, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
-	BOOL ok = FALSE;
-	if (va) {
-		ok = VirtualCopy(va, (void*)(phys_addr >> 8), 0x10000,
-		                 PAGE_READWRITE | PAGE_NOCACHE | PAGE_PHYSICAL);
-	}
+	HMODULE mh = GetModuleHandleW(L"coredll.dll");
+	kwr(0x80060da0, 0x80069de0);
+	CSM csm = (CSM) GetProcAddress(mh, L"GetFSHeapInfo");
+	DWORD mapped = (DWORD)csm(phys_addr >> 8, 0x10000);
+	kwr(0x80060da0, 0x80015020);
 
 	out[0] = 18;
-	if (ok && va) {
-		volatile u32* ptr = (volatile u32*)((BYTE*)va + io_offset);
-		*ptr = val;
+	if (mapped) {
+		kwr(mapped + io_offset, val);
 		out[1] = 1;
 	} else {
 		out[1] = 0;
-		DWORD err = GetLastError();
-		out[2] = err & 0xFF;
-		out[3] = (err >> 8) & 0xFF;
-		out[4] = (err >> 16) & 0xFF;
-		out[5] = (err >> 24) & 0xFF;
 	}
-	if (va) VirtualFree(va, 0, MEM_RELEASE);
-	if (safe_send(client, out, 32)) { closesocket(client); break; }
-
-// Cmd 19: BSEV DMA read - use Secure Boot Engine to DMA from src to dst
-// This can bypass CPU read protection on IROM
-// Packet: [19][src_phys:4][dst_phys:4][size:4]
-// Response: [19][ok:1][bsev_status:4]
-} else if (inbuf[0] == 19) {
-	u32 src_phys = ((u32)inbuf[1]) | ((u32)(inbuf[2] << 8)) | ((u32)(inbuf[3] << 16)) | ((u32)(inbuf[4] << 24));
-	u32 dst_phys = ((u32)inbuf[5]) | ((u32)(inbuf[6] << 8)) | ((u32)(inbuf[7] << 16)) | ((u32)(inbuf[8] << 24));
-	u32 dma_size = ((u32)inbuf[9]) | ((u32)(inbuf[10] << 8)) | ((u32)(inbuf[11] << 16)) | ((u32)(inbuf[12] << 24));
-
-	// Map BSEV registers at phys 0x60011000 (uncached)
-	void* bsev_va = VirtualAlloc(0, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
-	BOOL ok = FALSE;
-	if (bsev_va) {
-		ok = VirtualCopy(bsev_va, (void*)(0x60010000 >> 8), 0x10000,
-		                 PAGE_READWRITE | PAGE_NOCACHE | PAGE_PHYSICAL);
-	}
-
-	out[0] = 19;
-	if (ok && bsev_va) {
-		volatile u32* bsev = (volatile u32*)((BYTE*)bsev_va + 0x1000);
-
-		// BSEV AES/DMA registers (offsets from BSEV base 0x60011000):
-		// 0x00: CMDQUE_CONTROL
-		// 0x08: INTR_STATUS
-		// 0x10: BSE_CONFIG  (DMA config)
-		// 0x18: SECURE_DEST_ADDR
-		// 0x1C: SECURE_INPUT_SELECT
-		// 0x20: SECURE_CONFIG
-		// 0x44: SECURE_SECURITY (access control)
-
-		// Write src address
-		bsev[0x18/4] = dst_phys;    // SECURE_DEST_ADDR = destination
-
-		// Configure DMA: src address in SECURE_INPUT_SELECT
-		// Bits [31:16] = source address bits [31:16]
-		// Bits [15:14] = source select (0=memory)
-		bsev[0x1C/4] = (src_phys & 0xFFFF0000);
-
-		// SECURE_CONFIG: set transfer size
-		// Bits [12:0] = block count
-		bsev[0x20/4] = (dma_size / 16);  // AES block size = 16 bytes
-
-		// BSE_CONFIG: trigger DMA
-		// Bit 0 = start
-		bsev[0x10/4] = 1;
-
-		// Wait for completion (poll INTR_STATUS)
-		u32 status = 0;
-		for (int w = 0; w < 10000; w++) {
-			status = bsev[0x08/4];
-			if (status & 1) break;  // DMA complete
-			Sleep(1);
-		}
-
-		out[1] = 1;
-		out[2] = status & 0xFF;
-		out[3] = (status >> 8) & 0xFF;
-		out[4] = (status >> 16) & 0xFF;
-		out[5] = (status >> 24) & 0xFF;
-	} else {
-		out[1] = 0;
-		DWORD err = GetLastError();
-		out[2] = err & 0xFF;
-		out[3] = (err >> 8) & 0xFF;
-		out[4] = (err >> 16) & 0xFF;
-		out[5] = (err >> 24) & 0xFF;
-	}
-	if (bsev_va) VirtualFree(bsev_va, 0, MEM_RELEASE);
 	if (safe_send(client, out, 32)) { closesocket(client); break; }
 
 } else if (inbuf[0] == 15) {

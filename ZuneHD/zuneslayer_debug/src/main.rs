@@ -291,30 +291,93 @@ fn dump_via_kread(tcp: &mut TcpStream, vaddr: u32, sz: u32, filename: &str) {
     println!("[+] {} written ({} bytes)", filename, data.len());
 }
 
+// Cmd 17: Uncached I/O read
+fn io_read(tcp: &mut TcpStream, phys_addr: u32, offset: u32, count: u32) -> Result<Vec<u8>, String> {
+    let mut c = Vec::new();
+    c.push(17u8);
+    c.extend_from_slice(phys_addr.to_le_bytes().as_slice());
+    c.extend_from_slice(offset.to_le_bytes().as_slice());
+    c.extend_from_slice(count.to_le_bytes().as_slice());
+    c.resize(32, 0);
+    tcp.write_all(&c).unwrap();
+
+    // Read response: [17][ok:1][mapped_va:4][data:count] or [17][0][err:4][mapped:4]
+    let mut hdr = [0u8; 6];
+    tcp.read_exact(&mut hdr).map_err(|e| format!("hdr read: {}", e))?;
+    if hdr[0] != 17 { return Err(format!("bad cmd byte: {}", hdr[0])); }
+    let va_or_err = u32::from_le_bytes(hdr[2..6].try_into().unwrap());
+    if hdr[1] == 1 {
+        println!("    mapped VA: 0x{:08x}", va_or_err);
+        let mut data = vec![0u8; count as usize];
+        tcp.read_exact(&mut data).map_err(|e| format!("data read: {}", e))?;
+        Ok(data)
+    } else {
+        let mut extra = [0u8; 4];
+        tcp.read_exact(&mut extra).map_err(|e| format!("extra read: {}", e))?;
+        let mapped_val = u32::from_le_bytes(extra);
+        Err(format!("NKCreateStaticMapping failed, err={}, mapped=0x{:08x}", va_or_err, mapped_val))
+    }
+}
+
+// Cmd 18: Uncached I/O write
+fn io_write(tcp: &mut TcpStream, phys_addr: u32, offset: u32, val: u32) -> Result<(), String> {
+    let mut c = Vec::new();
+    c.push(18u8);
+    c.extend_from_slice(phys_addr.to_le_bytes().as_slice());
+    c.extend_from_slice(offset.to_le_bytes().as_slice());
+    c.extend_from_slice(val.to_le_bytes().as_slice());
+    c.resize(32, 0);
+    tcp.write_all(&c).unwrap();
+
+    let mut resp = [0u8; 32];
+    tcp.read_exact(&mut resp).map_err(|e| format!("resp read: {}", e))?;
+    if resp[0] != 18 { return Err(format!("bad cmd byte: {}", resp[0])); }
+    if resp[1] == 1 { Ok(()) }
+    else {
+        let code = u32::from_le_bytes(resp[2..6].try_into().unwrap());
+        Err(format!("VirtualCopy failed, error={}", code))
+    }
+}
+
+fn io_dump(tcp: &mut TcpStream, phys_addr: u32, offset: u32, count: u32, filename: &str) {
+    println!("[*] IO read 0x{:08x}+0x{:x} ({}B) -> {}", phys_addr, offset, count, filename);
+    match io_read(tcp, phys_addr, offset, count) {
+        Ok(data) => {
+            std::fs::write(filename, &data).unwrap();
+            // Print first few u32s
+            for i in (0..std::cmp::min(data.len(), 32)).step_by(4) {
+                let v = u32::from_le_bytes(data[i..i+4].try_into().unwrap());
+                print!("  +0x{:02x}: 0x{:08x}", i, v);
+                if (i/4) % 4 == 3 { println!(); }
+            }
+            println!();
+            println!("[+] {} ({} bytes)", filename, data.len());
+        }
+        Err(e) => println!("[-] FAIL: {}", e),
+    }
+}
+
 fn kttttt(tcp: &mut TcpStream) {
     std::fs::create_dir_all("dumps").unwrap();
 
-    // First try physdump for IRAM (large regions, cmd 15)
-    // If that fails, fall back to kread
+    // === Phase 1: Dump hardware registers via cmd 17 (uncached I/O read) ===
+    println!("=== Hardware Registers (uncached I/O) ===");
+    io_dump(tcp, 0x6000_0000, 0xC000, 0x100, "dumps/ahb_arb.bin");
+    io_dump(tcp, 0x6000_0000, 0xC200, 0x100, "dumps/secboot.bin");
+    io_dump(tcp, 0x6001_0000, 0x1000, 0x100, "dumps/bsev.bin");
+    io_dump(tcp, 0x6000_0000, 0x6000, 0x400, "dumps/clk_rst.bin");
+    io_dump(tcp, 0x7000_0000, 0xF800, 0x400, "dumps/fuse.bin");
 
-    // Use kread_u32 via kernel virtual addresses
-    // NKCreateStaticMapping maps phys >> 8 to kernel VA
-    // But we don't know the VAs, so use physdump (cmd 15) for everything
-
-    // Try physdump one at a time with error handling
-    let regions: Vec<(u32, u32, u32, &str)> = vec![
-        (0x6000_0000, 0xC000, 0x100, "dumps/ahb_arb.bin"),
-        (0x6000_0000, 0xC200, 0x100, "dumps/secboot.bin"),
-        (0x6001_0000, 0x1000, 0x100, "dumps/bsev.bin"),
-        (0x6000_0000, 0x6000, 0x400, "dumps/clk_rst.bin"),
-        (0x7000_0000, 0xF800, 0x400, "dumps/fuse.bin"),
+    // === Phase 2: Dump IRAM via cmd 15 (NKCreateStaticMapping) ===
+    println!("\n=== IRAM Banks (cached mapping) ===");
+    let iram_regions: Vec<(u32, u32, u32, &str)> = vec![
         (0x4000_0000, 0x0000, 0x10000, "dumps/iram_a.bin"),
         (0x4001_0000, 0x0000, 0x10000, "dumps/iram_b.bin"),
         (0x4002_0000, 0x0000, 0x10000, "dumps/iram_c.bin"),
         (0x4003_0000, 0x0000, 0x10000, "dumps/iram_d.bin"),
     ];
 
-    for (addr, offset, sz, filename) in &regions {
+    for (addr, offset, sz, filename) in &iram_regions {
         println!("[*] Dumping 0x{:08x}+0x{:x} ({}B) -> {}", addr, offset, sz, filename);
 
         let mut c = Vec::new();

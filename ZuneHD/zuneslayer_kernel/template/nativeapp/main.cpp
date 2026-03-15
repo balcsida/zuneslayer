@@ -422,31 +422,45 @@ void connection(SOCKET client) {
 
 	HMODULE mh = GetModuleHandleW(L"coredll.dll");
 
+	// Map the exact physical page containing phys_addr + io_offset
+	u32 map_phys = phys_addr + (io_offset & 0xFFFFF000);
+	u32 map_off  = io_offset & 0xFFF;
+
 	// Redirect GetFSHeapInfo -> NKCreateStaticMapping
 	kwr(0x80060da0, 0x80069de0);
 	CSM csm = (CSM) GetProcAddress(mh, L"GetFSHeapInfo");
-	DWORD mapped = (DWORD)csm(phys_addr >> 8, 0x10000);
+	SetLastError(0);
+	DWORD mapped = (DWORD)csm(map_phys >> 8, 0x1000);
+	DWORD err = GetLastError();
 
 	// Restore GetFSHeapInfo -> R/W gadget
 	kwr(0x80060da0, 0x80015020);
 	KFSH ghi = (KFSH) GetProcAddress(mh, L"GetFSHeapInfo");
 
-	unsigned char* rbuf = (unsigned char*)calloc(2 + count, 1);
+	unsigned char* rbuf = (unsigned char*)calloc(10 + count, 1);
 	rbuf[0] = 17;
 	if (mapped) {
 		rbuf[1] = 1;
+		// Send mapped VA in bytes 2-5 for debugging
+		rbuf[2] = mapped & 0xFF;
+		rbuf[3] = (mapped >> 8) & 0xFF;
+		rbuf[4] = (mapped >> 16) & 0xFF;
+		rbuf[5] = (mapped >> 24) & 0xFF;
 		for (u32 i = 0; i < count; i++) {
-			rbuf[2 + i] = (unsigned char)ghi(mapped + io_offset + i, 0, 0x1338);
+			rbuf[6 + i] = (unsigned char)ghi(mapped + map_off + i, 0, 0x1338);
 		}
-		safe_send(client, rbuf, 2 + count);
+		safe_send(client, rbuf, 6 + count);
 	} else {
 		rbuf[1] = 0;
-		DWORD err = GetLastError();
 		rbuf[2] = err & 0xFF;
 		rbuf[3] = (err >> 8) & 0xFF;
 		rbuf[4] = (err >> 16) & 0xFF;
 		rbuf[5] = (err >> 24) & 0xFF;
-		safe_send(client, rbuf, 6);
+		rbuf[6] = (mapped) & 0xFF;
+		rbuf[7] = (mapped >> 8) & 0xFF;
+		rbuf[8] = (mapped >> 16) & 0xFF;
+		rbuf[9] = (mapped >> 24) & 0xFF;
+		safe_send(client, rbuf, 10);
 	}
 	free(rbuf);
 

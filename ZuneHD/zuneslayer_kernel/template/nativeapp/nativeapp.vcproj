@@ -69,7 +69,7 @@
 			<Tool
 				Name="VCLinkerTool"
 				AdditionalOptions="/subsystem:windowsce,6.00"
-				AdditionalDependencies="coredll.lib corelibc.lib zdksystem.lib compclient.lib winsock.lib iphlpapi.lib wininet.lib $(NOINHERIT)"
+				AdditionalDependencies="coredll.lib corelibc.lib zdksystem.lib winsock.lib iphlpapi.lib wininet.lib $(NOINHERIT)"
 				LinkIncremental="2"
 				AdditionalLibraryDirectories=""
 				DelayLoadDLLs="$(NOINHERIT)"
@@ -162,7 +162,7 @@
 			<Tool
 				Name="VCLinkerTool"
 				AdditionalOptions="/subsystem:windowsce,6.00"
-				AdditionalDependencies="coredll.lib corelibc.lib zdksystem.lib compclient.lib $(NOINHERIT)"
+				AdditionalDependencies="coredll.lib corelibc.lib zdksystem.lib winsock.lib iphlpapi.lib wininet.lib $(NOINHERIT)"
 				LinkIncremental="1"
 				DelayLoadDLLs="$(NOINHERIT)"
 				GenerateDebugInformation="true"
@@ -283,6 +283,8 @@
 			<File
 				RelativePath=".\kwasm\main.c"
 				>
+				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
+				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 			<File
 				RelativePath=".\main.cpp"
@@ -307,22 +309,32 @@
 			<File
 				RelativePath=".\kwasm\platform.c"
 				>
+				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
+				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 			<File
 				RelativePath=".\kwasm\thunk.c"
 				>
+				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
+				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 			<File
 				RelativePath=".\kwasm\util.c"
 				>
+				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
+				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 			<File
 				RelativePath=".\kwasm\wa.c"
 				>
+				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
+				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 			<File
 				RelativePath=".\wasm.cpp"
 				>
+				<FileConfiguration Name="Debug|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
+				<FileConfiguration Name="Release|OpenZDK (ARMV4I)"><Tool Name="VCCLCompilerTool" ExcludedFromBuild="true"/></FileConfiguration>
 			</File>
 		</Filter>
 	</Files>

@@ -7,20 +7,12 @@
  */
 
 #include <windows.h>
-#include <zdk.h>
 #include <string>
 #include <stdlib.h>
 #include <stdio.h>
-#include <psapi.h>
 #include "xutility.h"
 
-#include "wasm.h"
-
-#include <assert.h>
-#include <stdio.h>
-#include <windows.h>
 #include <zdksystem.h>
-#include <zdknet.h>
 #include <winsock2.h>
 #include <Iphlpapi.h>
 #include "protocol/pb_encode.h"

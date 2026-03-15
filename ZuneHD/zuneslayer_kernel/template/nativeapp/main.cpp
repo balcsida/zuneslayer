@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <zdkinput.h>
-#include <zdkgl.h>
+// #include <zdkgl.h>
 #include <zdksystem.h>
 #include <zdknet.h>
 #include <zam.h>

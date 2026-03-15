@@ -176,6 +176,62 @@ void connection(SOCKET client) {
 					closesocket(client);
 					break;
 				}
+			// kernel write
+			} else if (inbuf[0] == 20) {
+				u32 addr = ((u32)inbuf[1]) | ((u32)(inbuf[2] << 8)) | ((u32)(inbuf[3] << 16)) | ((u32)(inbuf[4] << 24));
+				u32 val  = ((u32)inbuf[5]) | ((u32)(inbuf[6] << 8)) | ((u32)(inbuf[7] << 16)) | ((u32)(inbuf[8] << 24));
+				kwr(addr, val);
+				out[0] = 20;
+				out[1] = 1;
+				if (send(client,(char*)out,32,0) == SOCKET_ERROR){
+					closesocket(client);
+					break;
+				}
+			// Cmd 21: IROM full dump (64KB) via single NKCreateStaticMapping
+			// Maps IROM once, reads all 64KB, sends in 256-byte chunks.
+			// Packet:  [21]
+			// Response: [21][status:1] then 256 chunks of 256 bytes (64KB total)
+			} else if (inbuf[0] == 21) {
+				out[0] = 21;
+
+				// Map IROM via NKCreateStaticMapping — single mapping for entire dump
+				kwr(0x80060da0, 0x80069de0);
+				HMODULE mh21 = GetModuleHandleW(L"coredll.dll");
+				CSM csm21 = (CSM) GetProcAddress(mh21, L"GetFSHeapInfo");
+				DWORD irom_map = (DWORD)csm21(0xFFF00000 >> 8, 16); // 16 pages = 64KB
+				kwr(0x80060da0, 0x80015020);
+				KFSH ghi21 = (KFSH) GetProcAddress(mh21, L"GetFSHeapInfo");
+
+				if (!irom_map) {
+					out[1] = 0;
+					if (safe_send(client, out, 32)) { closesocket(client); break; }
+				} else {
+					// Probe first word
+					DWORD first = kreadu32(irom_map);
+					out[1] = 1;
+					out[2] = first & 0xFF;
+					out[3] = (first >> 8) & 0xFF;
+					out[4] = (first >> 16) & 0xFF;
+					out[5] = (first >> 24) & 0xFF;
+					if (safe_send(client, out, 32)) { closesocket(client); break; }
+
+					// Read and send IROM in 256-byte chunks
+					// Note: secure boot may limit readable range to first 1-4KB
+					// We try the full 64KB but stop gracefully on fault
+					u32 total_size = 0x10000; // try full 64KB
+					u32 fail = 0;
+					for (u32 off = 0; off < total_size && !fail; off += 256) {
+						unsigned char cb[256];
+						for (u32 i = 0; i < 256; i++) {
+							cb[i] = (unsigned char)ghi21(irom_map + off + i, 0, 0x1338);
+						}
+						if (send(client, (char*)cb, 256, 0) == SOCKET_ERROR) {
+							fail = 1;
+						}
+					}
+					if (fail) { closesocket(client); break; }
+				}
+
 			// openproc
 			} else if (inbuf[0] == 2) {
 				u32 id = ((u32)inbuf[1]) | ((u32)(inbuf[2] << 8)) | ((u32)(inbuf[3] << 16)) | ((u32)(inbuf[4] << 24));
@@ -422,15 +478,19 @@ void connection(SOCKET client) {
 
 	HMODULE mh = GetModuleHandleW(L"coredll.dll");
 
-	// Map the exact physical page containing phys_addr + io_offset
-	u32 map_phys = phys_addr + (io_offset & 0xFFFFF000);
-	u32 map_off  = io_offset & 0xFFF;
+	// Map the physical page(s) containing phys_addr + io_offset .. + io_offset + count
+	u32 abs_addr  = phys_addr + io_offset;
+	u32 map_phys  = abs_addr & 0xFFFFF000;            // page-align down
+	u32 map_off   = abs_addr & 0xFFF;                 // offset within first page
+	u32 end_addr  = abs_addr + count;
+	u32 num_pages = ((end_addr - map_phys) + 0xFFF) >> 12;  // pages needed
+	if (num_pages == 0) num_pages = 1;
 
 	// Redirect GetFSHeapInfo -> NKCreateStaticMapping
 	kwr(0x80060da0, 0x80069de0);
 	CSM csm = (CSM) GetProcAddress(mh, L"GetFSHeapInfo");
 	SetLastError(0);
-	DWORD mapped = (DWORD)csm(map_phys >> 8, 0x1000);
+	DWORD mapped = (DWORD)csm(map_phys >> 8, num_pages);
 	DWORD err = GetLastError();
 
 	// Restore GetFSHeapInfo -> R/W gadget
@@ -483,6 +543,67 @@ void connection(SOCKET client) {
 	}
 	if (safe_send(client, out, 32)) { closesocket(client); break; }
 
+// Cmd 19: Physical I/O read via VirtualCopy (user-mode MMIO mapping)
+// Packet: [19][phys_addr:4][offset:4][count:4]
+// Response: [19][ok:1][data:count] or [19][0][err:4]
+} else if (inbuf[0] == 19) {
+	u32 phys_addr = ((u32)inbuf[1]) | ((u32)(inbuf[2] << 8)) | ((u32)(inbuf[3] << 16)) | ((u32)(inbuf[4] << 24));
+	u32 io_offset = ((u32)inbuf[5]) | ((u32)(inbuf[6] << 8)) | ((u32)(inbuf[7] << 16)) | ((u32)(inbuf[8] << 24));
+	u32 count     = ((u32)inbuf[9]) | ((u32)(inbuf[10] << 8)) | ((u32)(inbuf[11] << 16)) | ((u32)(inbuf[12] << 24));
+	if (count > 4096) count = 4096;
+
+	// Calculate page-aligned physical address
+	u32 abs_addr  = phys_addr + io_offset;
+	u32 page_base = abs_addr & 0xFFFFF000;
+	u32 page_off  = abs_addr & 0xFFF;
+	u32 map_size  = ((page_off + count) + 0xFFF) & 0xFFFFF000; // round up to page
+
+	// Reserve VA range
+	void* vbase = VirtualAlloc(NULL, map_size, MEM_RESERVE, PAGE_NOACCESS);
+	SetLastError(0);
+	DWORD err = 0;
+	BOOL ok = FALSE;
+
+	if (vbase) {
+		// Map physical address into our process space
+		// PAGE_PHYSICAL tells VirtualCopy the source is a physical address (shifted right by 8)
+		// PAGE_READWRITE | PAGE_NOCACHE for uncached MMIO access
+		ok = VirtualCopy(vbase, (LPVOID)(page_base >> 8), map_size,
+			PAGE_READWRITE | PAGE_NOCACHE | PAGE_PHYSICAL);
+		err = GetLastError();
+	} else {
+		err = GetLastError();
+	}
+
+	out[0] = 19;
+	out[1] = (vbase && ok) ? 1 : 0;
+	out[2] = err & 0xFF;
+	out[3] = (err >> 8) & 0xFF;
+	out[4] = (err >> 16) & 0xFF;
+	out[5] = (err >> 24) & 0xFF;
+	// Store mapped VA for debugging
+	u32 mapped_va = (u32)vbase;
+	out[6] = mapped_va & 0xFF;
+	out[7] = (mapped_va >> 8) & 0xFF;
+	out[8] = (mapped_va >> 16) & 0xFF;
+	out[9] = (mapped_va >> 24) & 0xFF;
+	if (safe_send(client, out, 32)) { if (vbase) VirtualFree(vbase, 0, MEM_RELEASE); closesocket(client); break; }
+
+	if (vbase && ok) {
+		// Read data from mapped region
+		unsigned char* dbuf = (unsigned char*)calloc(count, 1);
+		unsigned char* src = ((unsigned char*)vbase) + page_off;
+		// Use volatile to prevent optimizer from caching reads
+		for (u32 i = 0; i < count; i++) {
+			dbuf[i] = ((volatile unsigned char*)src)[i];
+		}
+		if (safe_send(client, dbuf, count)) { free(dbuf); VirtualFree(vbase, 0, MEM_RELEASE); closesocket(client); break; }
+		free(dbuf);
+	}
+
+	// Cleanup
+	if (vbase) VirtualFree(vbase, 0, MEM_RELEASE);
+
 } else if (inbuf[0] == 15) {
 u32 idx = ((u32)inbuf[1]) | ((u32)(inbuf[2] << 8)) | ((u32)(inbuf[3] << 16)) | ((u32)(inbuf[4] << 24));
 u32 idx2 = ((u32)inbuf[5]) | ((u32)(inbuf[6] << 8)) | ((u32)(inbuf[7] << 16)) | ((u32)(inbuf[8] << 24));
@@ -517,9 +638,7 @@ u32 val = ((u32)inbuf[9]) | ((u32)(inbuf[10] << 8)) | ((u32)(inbuf[11] << 16)) |
 
 
 
-					//void* f = csm(0x40000000>>8, 0x10000);
-
-					void* f = (void*)sec_boot;//csm(idx>>8, val);
+					void* f = (void*)csm(idx>>8, val);
 
 					kwr(0x80060da0, 0x80015020);
 					

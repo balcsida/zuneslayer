@@ -187,49 +187,55 @@ void connection(SOCKET client) {
 					closesocket(client);
 					break;
 				}
-			// Cmd 21: IROM full dump (64KB) via single NKCreateStaticMapping
-			// Maps IROM once, reads all 64KB, sends in 256-byte chunks.
+			// Cmd 21: IROM full dump (64KB) — page-by-page NKCreateStaticMapping
+			// Maps each 4KB IROM page individually, reads and sends.
 			// Packet:  [21]
-			// Response: [21][status:1] then 256 chunks of 256 bytes (64KB total)
+			// Response: [21][1][pages_ok:1] then up to 64KB of data
+			//   For each page: sends [page_status:1] then 4096 bytes if status=1
 			} else if (inbuf[0] == 21) {
-				out[0] = 21;
-
-				// Map IROM via NKCreateStaticMapping — single mapping for entire dump
-				kwr(0x80060da0, 0x80069de0);
 				HMODULE mh21 = GetModuleHandleW(L"coredll.dll");
-				CSM csm21 = (CSM) GetProcAddress(mh21, L"GetFSHeapInfo");
-				DWORD irom_map = (DWORD)csm21(0xFFF00000 >> 8, 16); // 16 pages = 64KB
-				kwr(0x80060da0, 0x80015020);
-				KFSH ghi21 = (KFSH) GetProcAddress(mh21, L"GetFSHeapInfo");
+				out[0] = 21;
+				out[1] = 1;
+				if (safe_send(client, out, 32)) { closesocket(client); break; }
 
-				if (!irom_map) {
-					out[1] = 0;
-					if (safe_send(client, out, 32)) { closesocket(client); break; }
-				} else {
-					// Probe first word
-					DWORD first = kreadu32(irom_map);
-					out[1] = 1;
-					out[2] = first & 0xFF;
-					out[3] = (first >> 8) & 0xFF;
-					out[4] = (first >> 16) & 0xFF;
-					out[5] = (first >> 24) & 0xFF;
-					if (safe_send(client, out, 32)) { closesocket(client); break; }
+				// Dump 16 pages (64KB) one page at a time
+				for (u32 page = 0; page < 16; page++) {
+					u32 page_phys = 0xFFF00000 + page * 0x1000;
 
-					// Read and send IROM in 256-byte chunks
-					// Note: secure boot may limit readable range to first 1-4KB
-					// We try the full 64KB but stop gracefully on fault
-					u32 total_size = 0x10000; // try full 64KB
-					u32 fail = 0;
-					for (u32 off = 0; off < total_size && !fail; off += 256) {
-						unsigned char cb[256];
-						for (u32 i = 0; i < 256; i++) {
-							cb[i] = (unsigned char)ghi21(irom_map + off + i, 0, 0x1338);
+					// Map this single page
+					kwr(0x80060da0, 0x80069de0);
+					CSM csm21 = (CSM) GetProcAddress(mh21, L"GetFSHeapInfo");
+					DWORD page_map = (DWORD)csm21(page_phys >> 8, 1);
+					kwr(0x80060da0, 0x80015020);
+					KFSH ghi21 = (KFSH) GetProcAddress(mh21, L"GetFSHeapInfo");
+
+					unsigned char pg_status[1];
+					if (!page_map) {
+						pg_status[0] = 0; // mapping failed for this page
+						if (send(client, (char*)pg_status, 1, 0) == SOCKET_ERROR) { closesocket(client); break; }
+						// Send 4KB of zeros as placeholder
+						unsigned char zeros[256];
+						memset(zeros, 0, 256);
+						for (int z = 0; z < 16; z++) {
+							if (send(client, (char*)zeros, 256, 0) == SOCKET_ERROR) { closesocket(client); break; }
 						}
-						if (send(client, (char*)cb, 256, 0) == SOCKET_ERROR) {
-							fail = 1;
+					} else {
+						pg_status[0] = 1; // page mapped OK
+						if (send(client, (char*)pg_status, 1, 0) == SOCKET_ERROR) { closesocket(client); break; }
+
+						// Read 4KB in 256-byte chunks and send immediately
+						u32 pfail = 0;
+						for (u32 off = 0; off < 0x1000 && !pfail; off += 256) {
+							unsigned char cb[256];
+							for (u32 i = 0; i < 256; i++) {
+								cb[i] = (unsigned char)ghi21(page_map + off + i, 0, 0x1338);
+							}
+							if (send(client, (char*)cb, 256, 0) == SOCKET_ERROR) {
+								pfail = 1;
+							}
 						}
+						if (pfail) { closesocket(client); break; }
 					}
-					if (fail) { closesocket(client); break; }
 				}
 
 			// openproc

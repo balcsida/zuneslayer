@@ -1832,8 +1832,8 @@ fn main() {
     println!("{nk:x}");
 
     if true {
-        // Cmd 21: single-shot 64KB IROM dump with 256-byte send chunks
-        println!("=== IROM Dump via Cmd 21 (single mapping, 256B sends) ===");
+        // Cmd 21: page-by-page IROM dump (16 x 4KB pages)
+        println!("=== IROM Dump via Cmd 21 (page-by-page mapping) ===");
         std::fs::create_dir_all("dumps").unwrap();
 
         let mut c = vec![21u8];
@@ -1848,49 +1848,62 @@ fn main() {
             return;
         }
         if resp[1] != 1 {
-            println!("[-] IROM mapping failed (status=0x{:02x})", resp[1]);
+            println!("[-] cmd 21 failed (status=0x{:02x})", resp[1]);
             return;
         }
 
-        let first_word = u32::from_le_bytes(resp[2..6].try_into().unwrap());
-        println!("[+] IROM mapped, first word: 0x{:08x}", first_word);
-        println!("[*] Receiving 64KB (256-byte sends, ~4 minutes)...");
-
+        println!("[+] Starting page-by-page IROM dump (16 pages x 4KB)...");
         let mut irom_data = Vec::new();
-        let target = 0x10000usize;
-        let mut buf = [0u8; 4096];
-        loop {
-            match tcp.read(&mut buf) {
-                Ok(0) => {
-                    println!("    Connection closed at 0x{:x}", irom_data.len());
-                    break;
-                }
-                Ok(n) => {
-                    irom_data.extend_from_slice(&buf[..n]);
-                    if irom_data.len() % 0x1000 < n || irom_data.len() >= target {
-                        println!("    0x{:x}/0x{:x} ({:.0}%)",
-                            irom_data.len(), target,
-                            irom_data.len() as f64 / target as f64 * 100.0);
-                    }
-                    // Save progress
-                    if irom_data.len() % 0x4000 < n {
-                        std::fs::write("dumps/irom_partial.bin", &irom_data).unwrap();
-                    }
-                    if irom_data.len() >= target {
-                        break;
-                    }
-                }
+        let mut pages_ok = 0u32;
+        let mut pages_fail = 0u32;
+
+        for page in 0..16u32 {
+            let pa = 0xFFF00000u32 + page * 0x1000;
+
+            // Read page status byte
+            let mut status_byte = [0u8; 1];
+            match tcp.read_exact(&mut status_byte) {
+                Ok(()) => {}
                 Err(e) => {
-                    println!("    [-] Read error at 0x{:x}: {}", irom_data.len(), e);
+                    println!("  Page {:2} (PA 0x{:08x}): connection lost: {}", page, pa, e);
+                    // Pad remaining with zeros
+                    irom_data.resize((page as usize + 1) * 0x1000, 0);
                     break;
                 }
             }
+
+            // Read 4KB of page data
+            let mut page_data = vec![0u8; 0x1000];
+            match tcp.read_exact(&mut page_data) {
+                Ok(()) => {}
+                Err(e) => {
+                    println!("  Page {:2} (PA 0x{:08x}): data read failed: {}", page, pa, e);
+                    irom_data.extend_from_slice(&page_data);
+                    break;
+                }
+            }
+
+            if status_byte[0] == 1 {
+                let first = u32::from_le_bytes(page_data[..4].try_into().unwrap());
+                let nz = page_data.iter().filter(|&&b| b != 0).count();
+                println!("  Page {:2} (PA 0x{:08x}): OK  first=0x{:08x}  non-zero={}/4096",
+                    page, pa, first, nz);
+                pages_ok += 1;
+            } else {
+                println!("  Page {:2} (PA 0x{:08x}): MAPPING FAILED (zeros)", page, pa);
+                pages_fail += 1;
+            }
+
+            irom_data.extend_from_slice(&page_data);
+
+            // Save progress after each page
+            std::fs::write("dumps/irom.bin", &irom_data).unwrap();
         }
 
-        irom_data.truncate(target);
-
         println!("\n=== Result ===");
-        println!("  Received: {} / {} bytes", irom_data.len(), target);
+        println!("  Pages mapped:  {}/16", pages_ok);
+        println!("  Pages failed:  {}/16", pages_fail);
+        println!("  Total bytes:   {}", irom_data.len());
         if irom_data.len() >= 4 {
             let first = u32::from_le_bytes(irom_data[..4].try_into().unwrap());
             let nonzero = irom_data.iter().filter(|&&b| b != 0).count();
@@ -1898,8 +1911,6 @@ fn main() {
             println!("  Non-zero bytes: {}/{}", nonzero, irom_data.len());
             std::fs::write("dumps/irom.bin", &irom_data).unwrap();
             println!("[+] dumps/irom.bin written ({} bytes)", irom_data.len());
-        } else {
-            println!("[-] Not enough data received");
         }
 
         println!("\n[DONE]");

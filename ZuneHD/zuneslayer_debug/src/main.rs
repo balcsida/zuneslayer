@@ -1,4 +1,4 @@
-#![feature(str_from_utf16_endian)]
+// #![feature(str_from_utf16_endian)]
 #![allow(unused_variables)]
 #![allow(unreachable_code)]
 #![allow(dead_code)]
@@ -1714,7 +1714,7 @@ fn dlfile(tcp: &mut TcpStream, base: &String) -> Option<Vec<u8>> {
     let mut err_cnt = 0;
     let mut i = 0;
 
-    let mut bar = ProgressBar::new(1000);
+    let bar = ProgressBar::new(1000);
     bar.set_style(ProgressStyle::with_template ("{msg}: {wide_bar} {pos}/{len} {eta}").unwrap());
     bar.set_message(format!("{}: ", base));
 
@@ -1811,8 +1811,24 @@ fn dlfile(tcp: &mut TcpStream, base: &String) -> Option<Vec<u8>> {
 fn main() {
     tracing_subscriber::fmt::fmt().init();
 
-    let mut tcp = TcpStream::connect(("192.168.0.67", 1337)).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(600))).unwrap(); // 10min for large transfers
+    // Try listening for reverse-connect from device (USB mode) first,
+    // fall back to connecting to device (WiFi mode)
+    let mut tcp = {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(|s| s.as_str()) == Some("--listen") {
+            println!("[*] Listening on 0.0.0.0:1337 for device reverse-connect (USB mode)...");
+            let listener = std::net::TcpListener::bind("0.0.0.0:1337").unwrap();
+            listener.set_nonblocking(false).unwrap();
+            let (stream, addr) = listener.accept().unwrap();
+            println!("[+] Connection from {}", addr);
+            stream
+        } else {
+            let host = args.get(1).map(|s| s.as_str()).unwrap_or("192.168.0.67");
+            println!("[*] Connecting to {}:1337...", host);
+            TcpStream::connect((host, 1337)).unwrap()
+        }
+    };
+    tcp.set_read_timeout(Some(Duration::from_secs(600))).unwrap();
     tcp.set_nodelay(true).unwrap();
 
     loop {
@@ -1832,6 +1848,138 @@ fn main() {
     println!("{nk:x}");
 
     if true {
+        // Cmd 22: probe block devices for BCT
+        println!("=== Probing block devices for BCT (subcmd 0 = read only) ===");
+        let mut c = vec![22u8, 0u8]; // subcmd 0 = probe only
+        c.resize(32, 0);
+        tcp.write_all(&c).unwrap();
+
+        let mut resp = [0u8; 32];
+        tcp.read_exact(&mut resp).unwrap();
+
+        if resp[0] != 22 {
+            println!("[-] cmd 22 not recognized (got 0x{:02x})", resp[0]);
+            return;
+        }
+
+        let dev_names = ["DSK1:", "DSK2:", "DSK3:", "DSK4:",
+            "FLASHDRV:", "NAND1:", "NAND2:",
+            "Store:", "Part00:", "Part01:", "Part02:",
+            "\\\\.\\PhysicalDisk0"];
+
+        if resp[1] == 0 {
+            let err = u32::from_le_bytes(resp[2..6].try_into().unwrap());
+            println!("[-] No block device found (last error: 0x{:x})", err);
+        } else {
+            let dev_idx = resp[2] as usize;
+            let read_ok = resp[3];
+            let bytes_read = u16::from_le_bytes(resp[4..6].try_into().unwrap());
+            let has_ecec = resp[6];
+            let ecec_off = u16::from_le_bytes(resp[7..9].try_into().unwrap());
+
+            let dev_name = if dev_idx < dev_names.len() { dev_names[dev_idx] } else { "?" };
+            println!("[+] Device found: {} (index {})", dev_name, dev_idx);
+            println!("    Read OK: {}, bytes: {}", read_ok, bytes_read);
+            println!("    ECEC signature: {} (offset 0x{:x})", if has_ecec == 1 { "FOUND" } else { "not found" }, ecec_off);
+
+            // Read the 512-byte sector
+            let mut sector = vec![0u8; 512];
+            tcp.read_exact(&mut sector).unwrap();
+
+            // Display first 128 bytes
+            println!("    First 128 bytes of sector 0:");
+            for i in (0..128).step_by(16) {
+                let hex: Vec<String> = sector[i..i+16].iter().map(|b| format!("{:02x}", b)).collect();
+                println!("      {:04x}: {}", i, hex.join(" "));
+            }
+
+            // Save sector backup
+            std::fs::create_dir_all("dumps").unwrap();
+            std::fs::write("dumps/bct_sector0_backup.bin", &sector).unwrap();
+            println!("[+] Sector 0 backed up to dumps/bct_sector0_backup.bin");
+
+            if has_ecec == 1 {
+                println!("\n    BCT ECEC found at offset 0x{:x} in device {}", ecec_off, dev_name);
+                println!("    To corrupt: re-run with subcmd 1");
+            }
+        }
+
+        println!("\n[DONE]");
+        return;
+    }
+
+    if false {
+        // Probe IRAM and known memory locations for BCT (ECEC signature)
+        // The boot ROM copies BCT to IRAM during boot
+        println!("=== Probing for BCT in IRAM ===");
+
+        // IRAM is at uncached VA 0xBF400000 (PA 0x40000000)
+        // Scan IRAM banks for ECEC signature
+        let iram_bases: Vec<(u32, &str)> = vec![
+            (0xBF400000, "IRAM-A (PA 0x40000000)"),
+            (0xBF410000, "IRAM-B (PA 0x40010000)"),
+            (0xBF420000, "IRAM-C (PA 0x40020000)"),
+            (0xBF430000, "IRAM-D (PA 0x40030000)"),
+        ];
+
+        for (base, name) in &iram_bases {
+            // Check page table first
+            let pd_idx = (*base >> 20) & 0xFFF;
+            let pd_entry = kread_u32(&mut tcp, 0xFFFD0000 + pd_idx * 4);
+            if pd_entry & 3 != 2 {
+                println!("  {} — not mapped (PD=0x{:08x})", name, pd_entry);
+                continue;
+            }
+
+            // Scan for ECEC at 4KB intervals
+            for off in (0..0x10000u32).step_by(0x1000) {
+                let val = kread_u32(&mut tcp, base + off);
+                if val == 0x45434543 {
+                    println!("  {} + 0x{:04x} = 0x{:08x} <-- BCT FOUND!", name, off, val);
+                    // Read BCT header area
+                    println!("    BCT context (32 bytes):");
+                    for i in (0..32u32).step_by(4) {
+                        let v = kread_u32(&mut tcp, base + off + i);
+                        print!("  0x{:08x}", v);
+                    }
+                    println!();
+                }
+            }
+            // Also show first word of each bank
+            let first = kread_u32(&mut tcp, *base);
+            println!("  {} first word = 0x{:08x}", name, first);
+        }
+
+        // Also check if eMMC/NAND controller registers reveal flash layout
+        // Tegra NAND controller at PA 0x70008000 -> VA 0xBF708000
+        println!("\n=== NAND/eMMC controller probe ===");
+        let nand_va = 0xBF708000u32;
+        let pd_nand = kread_u32(&mut tcp, 0xFFFD0000 + (nand_va >> 20) * 4);
+        println!("  NAND PD entry = 0x{:08x}", pd_nand);
+        if pd_nand & 3 == 2 {
+            for off in (0..0x20u32).step_by(4) {
+                let v = kread_u32(&mut tcp, nand_va + off);
+                println!("  NAND+0x{:02x} = 0x{:08x}", off, v);
+            }
+        }
+
+        // SDMMC controller at PA 0xC8000000 -> check if mapped
+        // OEMAddressTable: PA 0xC8000000 -> VA 0x9FD00000 (cached) / 0xBFD00000 (uncached)
+        let sdmmc_va = 0xBFD00000u32;
+        let pd_sdmmc = kread_u32(&mut tcp, 0xFFFD0000 + (sdmmc_va >> 20) * 4);
+        println!("\n  SDMMC PD entry = 0x{:08x}", pd_sdmmc);
+        if pd_sdmmc & 3 == 2 {
+            for off in (0..0x20u32).step_by(4) {
+                let v = kread_u32(&mut tcp, sdmmc_va + off);
+                println!("  SDMMC+0x{:02x} = 0x{:08x}", off, v);
+            }
+        }
+
+        println!("\n[DONE]");
+        return;
+    }
+
+    if false {
         // Cmd 21: page-by-page IROM dump (16 x 4KB pages)
         println!("=== IROM Dump via Cmd 21 (page-by-page mapping) ===");
         std::fs::create_dir_all("dumps").unwrap();

@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
@@ -45,6 +47,66 @@ fn handle_request(mut stream: std::net::TcpStream, root: &Path) {
 
     println!("{} {} {}", peer, method, raw_path);
 
+    // Handle POST /upload/<filename> — device uploads data to PC
+    if method == "POST" && raw_path.starts_with("/upload/") {
+        let filename = &raw_path[8..]; // strip "/upload/"
+        let filename = url_decode(filename);
+
+        // Parse Content-Length from headers
+        let mut content_length: usize = 0;
+        for line in req.lines().skip(1) {
+            if line.to_lowercase().starts_with("content-length:") {
+                if let Ok(len) = line[15..].trim().parse() {
+                    content_length = len;
+                }
+            }
+        }
+
+        // Find the body (after \r\n\r\n)
+        let mut body_data = Vec::new();
+        if let Some(pos) = req.find("\r\n\r\n") {
+            let header_len = pos + 4;
+            // Body bytes already in our buffer
+            if header_len < n {
+                body_data.extend_from_slice(&buf[header_len..n]);
+            }
+        }
+
+        // Read remaining body data
+        while body_data.len() < content_length {
+            let mut more = [0u8; 4096];
+            match stream.read(&mut more) {
+                Ok(0) => break,
+                Ok(m) => body_data.extend_from_slice(&more[..m]),
+                Err(_) => break,
+            }
+        }
+
+        // Save to dumps directory
+        let dumps_dir = root.join("../zuneslayer_debug/dumps");
+        let _ = fs::create_dir_all(&dumps_dir);
+        let save_path = dumps_dir.join(&filename);
+        match fs::write(&save_path, &body_data) {
+            Ok(()) => {
+                println!("[+] Saved upload: {} ({} bytes) -> {}", filename, body_data.len(), save_path.display());
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            Err(e) => {
+                eprintln!("[-] Save failed: {}", e);
+                let body = format!("Save failed: {}", e);
+                let resp = format!(
+                    "HTTP/1.0 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        }
+        return;
+    }
+
     if method != "GET" {
         let body = "405 Method Not Allowed";
         let resp = format!(
@@ -53,6 +115,12 @@ fn handle_request(mut stream: std::net::TcpStream, root: &Path) {
             body
         );
         let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
+
+    // Quick 204 for favicon/icon requests
+    if raw_path.contains("apple-touch-icon") || raw_path.contains("favicon.ico") {
+        let _ = stream.write_all(b"HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n");
         return;
     }
 
@@ -88,11 +156,44 @@ fn handle_request(mut stream: std::net::TcpStream, root: &Path) {
         file_path
     };
 
+    // Serve orig.html at / to skip redirect round-trip
+    let file_path = if req_path == "/index.html" || req_path == "/" {
+        let exploit = root.join("orig.html");
+        if exploit.exists() { exploit } else { file_path }
+    } else {
+        file_path
+    };
+
+    // Gzip disabled — IE Mobile 6 on WinCE may not decompress correctly
+    // even though it sends Accept-Encoding: gzip
+    let accepts_gzip = false;
+
     match fs::read(&file_path) {
         Ok(data) => {
             let ct = content_type(&file_path);
+            let is_text = ct.starts_with("text/") || ct.contains("javascript") || ct.contains("json");
+
+            // Gzip text content over 512 bytes (per optimization guide)
+            if accepts_gzip && is_text && data.len() > 512 {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+                let _ = encoder.write_all(&data);
+                if let Ok(compressed) = encoder.finish() {
+                    let saved = data.len() as i64 - compressed.len() as i64;
+                    println!("  gzip: {} -> {} ({:+} bytes)", data.len(), compressed.len(), -saved);
+                    let header = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                        ct,
+                        compressed.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&compressed);
+                    return;
+                }
+            }
+
+            // Uncompressed fallback
             let header = format!(
-                "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                 ct,
                 data.len()
             );

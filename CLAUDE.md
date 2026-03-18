@@ -73,15 +73,27 @@ nativeapp runs a binary TCP protocol on port 1337. Each command is a 32-byte pac
 - **kreadb(addr)**: Redirects `GetFSHeapInfo` function pointer at `0x80060da0` to gadget at `0x80015020`, calls it with magic `0x1338` (read) or `0x1337` (write).
 - **NKCreateStaticMapping**: Redirects `GetFSHeapInfo` to `0x80069de0`, calls to map physical addresses to kernel VAs.
 
-### Memory Map (from OEMAddressTable in NK.bin)
+### Memory Map (full OEMAddressTable from NK.bin v4.5, offset 0x39B2F)
 Only **uncached** VAs (`0xBFxxxxxx`) are mapped in the page table. Cached VAs (`0x9Fxxxxxx`) are FAULT.
 
 | Physical | Uncached VA | Description |
 |----------|------------|-------------|
+| 0x00000000 | 0xA0000000 | SDRAM (128 MB) |
+| 0x58000000 | 0xBE000000 | External Memory (16 MB) |
+| 0x54000000 | 0xBF000000 | Peripheral (4 MB) |
+| 0x40000000 | 0xBF400000 | IRAM (1 MB) |
+| 0x50000000 | 0xBF500000 | Peripheral (1 MB) |
 | 0x60000000 | 0xBF600000 | AHB / CLK_RST / Secure Boot |
 | 0x70000000 | 0xBF700000 | Fuse / PMC (crashes on access — clock off) |
+| 0xB0000000 | 0xBF800000 | Peripheral (2 MB) |
+| 0xB8000000 | 0xBFA00000 | Peripheral (2 MB) |
+| 0xC5000000 | 0xBFC00000 | USB controllers (USB1/USB2D/USB3) |
+| 0xC8000000 | 0xBFD00000 | Peripheral (1 MB) |
+| 0xC3000000 | 0xBFE00000 | Peripheral (1 MB) |
 | 0xFFF00000 | 0xBFF00000 | IROM (Boot ROM) — only page 0 readable |
-| 0x40000000 | 0xBF400000 | IRAM |
+| 0x80000000 | 0xBDC00000 | External SDRAM (4 MB) |
+
+USB2D device controller (ChipIdea/EHCI): PA `0xC5004000`, VA `0xBFC04000`
 
 ### IROM Protection
 - `SB_CSR_0` at PA `0x6000C200`: `PIROM_DISABLE=1` (sticky bit, cannot be software-cleared)

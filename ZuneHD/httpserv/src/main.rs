@@ -9,8 +9,23 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+
+/// Shared state for the reverse command channel.
+/// PC submits commands via POST /cmd/submit, Zune polls GET /cmd/poll,
+/// Zune posts results via POST /cmd/response, PC reads GET /cmd/result.
+struct CmdQueue {
+    pending: Option<Vec<u8>>,   // next command for the Zune to execute
+    response: Option<Vec<u8>>,  // last response from the Zune
+}
+
+impl CmdQueue {
+    fn new() -> Self {
+        Self { pending: None, response: None }
+    }
+}
 
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
@@ -25,7 +40,41 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-fn handle_request(mut stream: std::net::TcpStream, root: &Path) {
+fn read_body(_req: &str, buf: &[u8], n: usize, stream: &mut std::net::TcpStream) -> Vec<u8> {
+    // Parse Content-Length from raw bytes (avoid UTF-8 lossy issues with binary bodies)
+    let mut content_length: usize = 0;
+    let header_str = String::from_utf8_lossy(&buf[..std::cmp::min(n, 1024)]);
+    for line in header_str.lines() {
+        if line.to_lowercase().starts_with("content-length:") {
+            if let Ok(len) = line[15..].trim().parse() {
+                content_length = len;
+            }
+        }
+    }
+    // Find \r\n\r\n in raw bytes
+    let mut body = Vec::new();
+    let mut hdr_end = 0;
+    for i in 0..n.saturating_sub(3) {
+        if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+            hdr_end = i + 4;
+            break;
+        }
+    }
+    if hdr_end > 0 && hdr_end < n {
+        body.extend_from_slice(&buf[hdr_end..n]);
+    }
+    while body.len() < content_length {
+        let mut more = [0u8; 4096];
+        match stream.read(&mut more) {
+            Ok(0) => break,
+            Ok(m) => body.extend_from_slice(&more[..m]),
+            Err(_) => break,
+        }
+    }
+    body
+}
+
+fn handle_request(mut stream: std::net::TcpStream, root: &Path, cmd_queue: &Arc<Mutex<CmdQueue>>) {
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
 
     let mut buf = [0u8; 4096];
@@ -47,40 +96,79 @@ fn handle_request(mut stream: std::net::TcpStream, root: &Path) {
 
     println!("{} {} {}", peer, method, raw_path);
 
+    // --- Reverse command channel ---
+
+    // POST /cmd/submit — PC submits a command (32 bytes) for the Zune to execute
+    if method == "POST" && raw_path == "/cmd/submit" {
+        let body = read_body(&req, &buf, n, &mut stream);
+        if body.len() >= 32 {
+            let mut q = cmd_queue.lock().unwrap();
+            println!("[cmd] Enqueued command: cmd={} subcmd={} ({} bytes)", body[0], body[1], body.len());
+            q.pending = Some(body);
+            // Don't clear response — let it persist until overwritten by next Zune response
+            let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+        } else {
+            let _ = stream.write_all(b"HTTP/1.0 400 Bad Request\r\nContent-Length: 22\r\n\r\nNeed at least 32 bytes");
+        }
+        return;
+    }
+
+    // GET /cmd/poll — Zune polls for pending command
+    if method == "GET" && raw_path == "/cmd/poll" {
+        let mut q = cmd_queue.lock().unwrap();
+        if let Some(cmd) = q.pending.take() {
+            println!("[cmd] Zune polled -> delivering cmd={} ({} bytes)", cmd[0], cmd.len());
+            let hdr = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                cmd.len()
+            );
+            let _ = stream.write_all(hdr.as_bytes());
+            let _ = stream.write_all(&cmd);
+        } else {
+            let _ = stream.write_all(b"HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n");
+        }
+        return;
+    }
+
+    // POST /cmd/response — Zune uploads command response
+    if method == "POST" && raw_path == "/cmd/response" {
+        let body = read_body(&req, &buf, n, &mut stream);
+        println!("[cmd] Zune responded: {} bytes", body.len());
+        if body.len() >= 32 {
+            // Print first 32 bytes as hex
+            let hex: Vec<String> = body[..32].iter().map(|b| format!("{:02x}", b)).collect();
+            println!("[cmd]   header: {}", hex.join(" "));
+        }
+        {
+            let mut q = cmd_queue.lock().unwrap();
+            q.response = Some(body);
+        }
+        let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+        return;
+    }
+
+    // GET /cmd/result — PC reads last response from Zune
+    if method == "GET" && raw_path == "/cmd/result" {
+        let q = cmd_queue.lock().unwrap();
+        if let Some(resp) = &q.response {
+            let hdr = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                resp.len()
+            );
+            let _ = stream.write_all(hdr.as_bytes());
+            let _ = stream.write_all(resp);
+        } else {
+            let _ = stream.write_all(b"HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n");
+        }
+        return;
+    }
+
     // Handle POST /upload/<filename> — device uploads data to PC
     if method == "POST" && raw_path.starts_with("/upload/") {
         let filename = &raw_path[8..]; // strip "/upload/"
         let filename = url_decode(filename);
 
-        // Parse Content-Length from headers
-        let mut content_length: usize = 0;
-        for line in req.lines().skip(1) {
-            if line.to_lowercase().starts_with("content-length:") {
-                if let Ok(len) = line[15..].trim().parse() {
-                    content_length = len;
-                }
-            }
-        }
-
-        // Find the body (after \r\n\r\n)
-        let mut body_data = Vec::new();
-        if let Some(pos) = req.find("\r\n\r\n") {
-            let header_len = pos + 4;
-            // Body bytes already in our buffer
-            if header_len < n {
-                body_data.extend_from_slice(&buf[header_len..n]);
-            }
-        }
-
-        // Read remaining body data
-        while body_data.len() < content_length {
-            let mut more = [0u8; 4096];
-            match stream.read(&mut more) {
-                Ok(0) => break,
-                Ok(m) => body_data.extend_from_slice(&more[..m]),
-                Err(_) => break,
-            }
-        }
+        let body_data = read_body(&req, &buf, n, &mut stream);
 
         // Save to dumps directory
         let dumps_dir = root.join("../zuneslayer_debug/dumps");
@@ -293,9 +381,11 @@ fn main() {
     println!("Serving {} on http://0.0.0.0:{}", root.display(), port);
     println!("Point the Zune HD browser to http://<this-ip>:{}/", port);
 
+    let cmd_queue = Arc::new(Mutex::new(CmdQueue::new()));
+
     for stream in listener.incoming() {
         match stream {
-            Ok(s) => handle_request(s, &root),
+            Ok(s) => handle_request(s, &root, &cmd_queue),
             Err(e) => eprintln!("accept error: {}", e),
         }
     }

